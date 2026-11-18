@@ -19,6 +19,11 @@
 #ifndef SECP256K1_FIELD_H
 #define SECP256K1_FIELD_H
 
+/* Version marker for the Colab notebook's staleness check: the bootstrap cell
+ * asserts this is present so a failed `git pull` can never silently run old
+ * kernel sources again. Bump on every behavioural change to this header. */
+#define SECP_FIELD_VERSION 4
+
 /* NVRTC (CuPy's default runtime compiler) does not ship <stdint.h>; nvcc and
  * the host compilers do. Provide the exact-width types ourselves under NVRTC. */
 #if defined(__CUDACC_RTC__)
@@ -137,88 +142,60 @@ SECP_INLINE int secp_is_zero(const uint64_t *a) {
     return acc == 0;
 }
 
-/* ---- Multiplication and reduction --------------------------------------- */
-
-#if defined(__CUDA_ARCH__)
-/* PTX inline assembly for the 64x64 -> 128-bit multiply-accumulate hot path.
- * This mirrors KeyHunt / VanitySearch's GPUMath.h: native mul.lo/mul.hi and
- * carry-chained add.cc/addc are tighter than emulated `__int128`.  Only used
- * in device code; the host keeps the portable `__int128` version below. */
-
-#define SECP_MUL_LO(c, a, b) asm volatile("mul.lo.u64 %0, %1, %2;" : "=l"(c) : "l"((uint64_t)(a)), "l"((uint64_t)(b)))
-#define SECP_MUL_HI(c, a, b) asm volatile("mul.hi.u64 %0, %1, %2;" : "=l"(c) : "l"((uint64_t)(a)), "l"((uint64_t)(b)))
-#define SECP_ADD_CC(c, b) asm volatile("add.cc.u64 %0, %0, %1;" : "+l"(c) : "l"((uint64_t)(b)))
-#define SECP_ADDC(c, b) asm volatile("addc.cc.u64 %0, %0, %1;" : "+l"(c) : "l"((uint64_t)(b)))
-
-/* (t, carry) += ai * bj, i.e. t = low64(ai*bj + t + carry), carry = high64. */
-SECP_INLINE void secp_mac(uint64_t &t, uint64_t &carry, uint64_t ai, uint64_t bj) {
-    uint64_t lo, hi;
-    SECP_MUL_LO(lo, ai, bj);
-    SECP_MUL_HI(hi, ai, bj);
-    SECP_ADD_CC(lo, t);     /* lo += t            (CC = c1) */
-    SECP_ADDC(hi, 0);       /* hi += c1 */
-    SECP_ADD_CC(lo, carry); /* lo += carry        (CC = c2) */
-    SECP_ADDC(hi, 0);       /* hi += c2 */
-    t = lo;
-    carry = hi;
-}
-
-/* t = a * b as an 8-limb (512-bit) little-endian product (row method). */
+/* t = a * b as an 8-limb (512-bit) little-endian product.
+ *
+ * Fully unrolled row method: all eight accumulators stay in registers, so no
+ * local-memory arrays are involved.  nvcc and NVRTC lower the `unsigned
+ * __int128` multiply-accumulate below to exactly the same mul.lo/mul.hi +
+ * add.cc/addc SASS that hand-written PTX would produce, so this needs no
+ * inline asm and compiles on every CUDA version (including strict NVRTC,
+ * which rejects 32-bit immediates bound to the 64-bit "l" constraint). */
 SECP_INLINE void secp_mul512(uint64_t t[8], const uint64_t *a, const uint64_t *b) {
     uint64_t a0 = a[0], a1 = a[1], a2 = a[2], a3 = a[3];
     uint64_t b0 = b[0], b1 = b[1], b2 = b[2], b3 = b[3];
     uint64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5 = 0, t6 = 0, t7 = 0;
-    uint64_t carry;
+    uint64_t c;
 
-    carry = 0;
-    secp_mac(t0, carry, a0, b0);
-    secp_mac(t1, carry, a0, b1);
-    secp_mac(t2, carry, a0, b2);
-    secp_mac(t3, carry, a0, b3);
-    t4 = carry;
+#define SECP_MADD(dst, ai, bi) do {                                   \
+        unsigned __int128 p_ = (unsigned __int128)(ai) * (bi)         \
+                               + (dst) + c;                           \
+        (dst) = (uint64_t)p_;                                         \
+        c = (uint64_t)(p_ >> 64);                                     \
+    } while (0)
 
-    carry = 0;
-    secp_mac(t1, carry, a1, b0);
-    secp_mac(t2, carry, a1, b1);
-    secp_mac(t3, carry, a1, b2);
-    secp_mac(t4, carry, a1, b3);
-    t5 = carry;
+    c = 0;
+    SECP_MADD(t0, a0, b0);
+    SECP_MADD(t1, a0, b1);
+    SECP_MADD(t2, a0, b2);
+    SECP_MADD(t3, a0, b3);
+    t4 = c;
 
-    carry = 0;
-    secp_mac(t2, carry, a2, b0);
-    secp_mac(t3, carry, a2, b1);
-    secp_mac(t4, carry, a2, b2);
-    secp_mac(t5, carry, a2, b3);
-    t6 = carry;
+    c = 0;
+    SECP_MADD(t1, a1, b0);
+    SECP_MADD(t2, a1, b1);
+    SECP_MADD(t3, a1, b2);
+    SECP_MADD(t4, a1, b3);
+    t5 = c;
 
-    carry = 0;
-    secp_mac(t3, carry, a3, b0);
-    secp_mac(t4, carry, a3, b1);
-    secp_mac(t5, carry, a3, b2);
-    secp_mac(t6, carry, a3, b3);
-    t7 = carry;
+    c = 0;
+    SECP_MADD(t2, a2, b0);
+    SECP_MADD(t3, a2, b1);
+    SECP_MADD(t4, a2, b2);
+    SECP_MADD(t5, a2, b3);
+    t6 = c;
+
+    c = 0;
+    SECP_MADD(t3, a3, b0);
+    SECP_MADD(t4, a3, b1);
+    SECP_MADD(t5, a3, b2);
+    SECP_MADD(t6, a3, b3);
+    t7 = c;
+
+#undef SECP_MADD
 
     t[0] = t0; t[1] = t1; t[2] = t2; t[3] = t3;
     t[4] = t4; t[5] = t5; t[6] = t6; t[7] = t7;
 }
-
-#else
-
-/* t = a * b as an 8-limb (512-bit) little-endian product. */
-SECP_INLINE void secp_mul512(uint64_t t[8], const uint64_t *a, const uint64_t *b) {
-    for (int i = 0; i < 8; i++) t[i] = 0;
-    for (int i = 0; i < 4; i++) {
-        uint64_t carry = 0;
-        for (int j = 0; j < 4; j++) {
-            unsigned __int128 cur = (unsigned __int128)a[i] * b[j] + t[i + j] + carry;
-            t[i + j] = (uint64_t)cur;
-            carry = (uint64_t)(cur >> 64);
-        }
-        t[i + 4] = carry;
-    }
-}
-
-#endif /* __CUDA_ARCH__ */
 
 /* Fold a 512-bit product into a 5-limb value < 2^289 using 2^256 == C.
  *   u = low(t) + (high(t) << 32) + high(t) * 977   (mod p)
@@ -288,38 +265,10 @@ SECP_INLINE void secp_mul(uint64_t *r, const uint64_t *a, const uint64_t *b) {
     for (int i = 0; i < 4; i++) r[i] = u[i];
 }
 
-/* Add the 128-bit value (hi << 64 | lo) into the 8-limb accumulator t starting
- * at limb k, propagating carries upward. */
-SECP_INLINE void secp_add128_at(uint64_t t[8], uint64_t lo, uint64_t hi, int k) {
-    unsigned __int128 c = (unsigned __int128)t[k] + lo;
-    t[k] = (uint64_t)c;
-    c = (unsigned __int128)t[k + 1] + hi + (uint64_t)(c >> 64);
-    t[k + 1] = (uint64_t)c;
-    c >>= 64;
-    for (int j = k + 2; j < 8 && c; j++) {
-        c = (unsigned __int128)t[j] + (uint64_t)c;
-        t[j] = (uint64_t)c;
-        c >>= 64;
-    }
-}
-
-/* r = a^2 mod p, exploiting the a_i*a_j == a_j*a_i symmetry (10 products
- * instead of 16). */
+/* r = a^2 mod p.  Uses the same register-only unrolled product as secp_mul so
+ * no local-memory arrays are touched on the device. */
 SECP_INLINE void secp_sqr(uint64_t *r, const uint64_t *a) {
-    uint64_t t[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    for (int i = 0; i < 4; i++) {
-        unsigned __int128 d = (unsigned __int128)a[i] * a[i];
-        secp_add128_at(t, (uint64_t)d, (uint64_t)(d >> 64), 2 * i);
-        for (int j = i + 1; j < 4; j++) {
-            unsigned __int128 p = (unsigned __int128)a[i] * a[j];
-            secp_add128_at(t, (uint64_t)p, (uint64_t)(p >> 64), i + j);
-            secp_add128_at(t, (uint64_t)p, (uint64_t)(p >> 64), i + j);
-        }
-    }
-    uint64_t u[5];
-    secp_fold512(u, t);
-    secp_reduce5(u);
-    for (int i = 0; i < 4; i++) r[i] = u[i];
+    secp_mul(r, a, a);
 }
 
 /* r = a^(-1) mod p, via the addition chain for p - 2 = 2^256 - 2^32 - 979

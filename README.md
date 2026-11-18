@@ -33,14 +33,13 @@ scanners such as VanitySearch / KeyHunt (which reach ~1 Gkeys/s on an L4 and
   builds a 32-point table `2^k·(sub·G)` once, and each thread's centre is at
   most 32 (avg ~16) point additions instead of a full 256-doubling scalar
   multiplication.
-* **PTX inline-asm field arithmetic.** The 64×64→128-bit multiply-accumulate hot
-  path uses native `mul.lo.u64`/`mul.hi.u64`/`add.cc`/`addc.cc` PTX (the same
-  technique as KeyHunt's `GPUMath.h`), with the secp256k1 reduction
+* **Register-only field arithmetic.** The 512-bit multiply is a fully unrolled
+  row method with all eight accumulators in registers (no local-memory arrays);
+  nvcc/NVRTC lower the `unsigned __int128` multiply-accumulate to native
+  `mul.lo`/`mul.hi` + `add.cc`/`addc` SASS, with the secp256k1 reduction
   `2²⁵⁶ ≡ 2³² + 977 (mod p)`.
-* **Addition-chain inversion and symmetric squaring.** `secp_inv` uses Brian
-  Smith's addition chain for `p − 2` (~267 squarings + 15 multiplications, ≈2.2×
-  faster than Fermat), and `secp_sqr` exploits the `aᵢaⱼ = aⱼaᵢ` symmetry
-  (10 products instead of 16).
+* **Addition-chain inversion.** `secp_inv` uses Brian Smith's addition chain for
+  `p − 2` (~267 squarings + 15 multiplications, ≈2.2× faster than Fermat).
 
 The correctness-critical field/point helpers (`csrc/secp256k1_field.h`,
 `csrc/secp256k1_point.h`, `csrc/secp256k1_grouped.h`) are compiled for **both**
