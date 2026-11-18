@@ -30,7 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--compressed", action="store_true", help="emit 33-byte SEC compressed keys")
     parser.add_argument("--backend", choices=["auto", "gpu", "cpu", "reference", "hybrid"], default="auto")
     parser.add_argument("--nthreads", type=int, default=0, help="CPU OpenMP threads (0 = default)")
-    parser.add_argument("--cpu-share", type=float, default=None, help="hybrid: CPU share of the range (default: calibrated)")
+    parser.add_argument("--cpu-share", type=float, default=None, help="hybrid: CPU share of the range (default 0 with a GPU; even 5%% is usually slower)")
     parser.add_argument("--grp-size", type=int, default=128, help="GPU block size (keys per thread per step, even)")
     parser.add_argument("--gpu-threads", type=int, default=32768, help="GPU thread count target")
     parser.add_argument("--gpu-chunk", type=int, default=1 << 26, help="GPU chunk size (bounds device memory)")

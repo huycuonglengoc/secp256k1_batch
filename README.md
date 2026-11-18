@@ -93,9 +93,13 @@ generates competes for exactly the bandwidth the GPU path needs. On Colab
 
 | Configuration | Rate |
 |---|---|
-| GPU only | **21.0 M keys/s** |
+| GPU only | **21.1 M keys/s** |
+| 5% CPU share | 17.9 M keys/s |
 | 10% CPU share | 14.5 M keys/s |
-| ~5% CPU share | ≈ GPU-only (the CPU finishes first) |
+
+Even 5% costs ~15%, because those keys still have to be written into the same
+host buffer the GPU is filling: the bottleneck is host memory bandwidth, not
+compute.
 
 The CPU is still busy at the parts it does best — building the tables,
 scheduling, allocating and assembling the output, and (when the GPU's compute
@@ -186,9 +190,19 @@ that path as cheap as possible:
   `secp256k1_compress_kernel` turns 64-byte keys into 33-byte keys on the GPU,
   so 48% less data crosses PCIe and there is no host conversion pass.
 
-That last number is the real ceiling of a bytes-returning API: producing 3.2 GB
-of `bytes` costs about 2 s no matter how fast the GPU is. Use
-`iter_public_key_chunks` (or the CLI `-o` path) to skip it when streaming.
+That last number is the real ceiling: the host copies at ~1.66 GB/s, so the
+theoretical maximum is ~26 M keys/s raw (64 B/key) and ~50 M keys/s compressed
+(33 B/key). Measured on a Colab T4:
+
+| Path | Rate | % of the host ceiling |
+|---|---|---|
+| RAW kernel (compute only) | 1223 M keys/s | — |
+| `generate` / streaming, raw | 21.1 / 20.9 M keys/s | 81% |
+| `generate` / streaming, compressed | 38.0 / 37.7 M keys/s | 76% |
+
+So the GPU computes 58× faster than the host can carry the keys away. Anything
+beyond ~21 M keys/s (raw) or ~38 M keys/s (compressed) requires not sending the
+keys to the host at all — e.g. hashing and filtering them on the device.
 
 ## Correctness
 
