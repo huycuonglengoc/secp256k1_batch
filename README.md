@@ -4,10 +4,10 @@ Generate **millions of secp256k1 public keys** from a contiguous private-key
 range, squeezing the last drop of performance out of both the CPU and the GPU.
 Designed to run unmodified in **Google Colab**.
 
-This package is built on the design principles of a heterogeneous CPU/GPU
-execution pipeline (batching, asynchronous device use, and correctness
-validation against a trusted oracle) and applies them to a real cryptographic
-workload: deriving `k·G` for the secp256k1 curve used by Bitcoin.
+This package is built on the design principles of this repository's
+`hetero_pipeline` (heterogeneous CPU/GPU execution, batching, correctness
+validation against a trusted oracle), but adds a real cryptographic workload:
+deriving `k·G` for the secp256k1 curve used by Bitcoin.
 
 ```
 private keys:  start, start+1, ..., start+count-1
@@ -80,8 +80,9 @@ python3 -m secp256k1_batch.cli --start 1 --count 1000000 --compressed --backend 
 ## Tuning
 
 * GPU: `--keys-per-thread` controls the scalar-multiply vs. add trade-off.
-  Larger values amortize the per-thread scalar multiplication but reduce
-  parallelism. `1024` is a good default for a T4.
+  The per-thread batch inversion is a long serial chain, so smaller values
+  shorten it and expose more parallelism. `64` is the measured sweet spot on
+  a T4; try `32`–`256` for your GPU.
 * GPU: `--gpu-chunk` bounds device memory; the range is processed in chunks.
 * CPU: `--nthreads` sets OpenMP threads (Colab: use the CPU core count).
 

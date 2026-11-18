@@ -50,7 +50,7 @@ def _compiled_module():
 class GPUBackend:
     """Generates public keys for a contiguous private-key range on the GPU."""
 
-    def __init__(self, device: int = 0, keys_per_thread: int = 1024, chunk: int = 1 << 22) -> None:
+    def __init__(self, device: int = 0, keys_per_thread: int = 64, chunk: int = 1 << 22) -> None:
         import cupy as cp
 
         self.cp = cp
