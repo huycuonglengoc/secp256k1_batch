@@ -169,6 +169,29 @@ class HybridBackendTests(unittest.TestCase):
             self.calls.append((start, count, compressed))
             return self._cpu.generate(start, count, compressed, nthreads=1)
 
+    class _SharedGPU(_StubGPU):
+        """Also implements the shared-buffer API of the real GPU backend."""
+
+        name = "gpu-shared-stub"
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.allocated = 0
+
+        def alloc_host_buffer(self, nbytes: int):
+            import numpy as np
+
+            self.allocated = nbytes
+            return None, np.empty(nbytes, dtype=np.uint8)
+
+        def generate_into(self, start, count, compressed, dest, at=0) -> int:
+            import numpy as np
+
+            self.calls.append((start, count, compressed))
+            data = self._cpu.generate(start, count, compressed, nthreads=1)
+            dest[at : at + len(data)] = np.frombuffer(data, dtype=np.uint8)
+            return len(data)
+
     def test_split_counts_invariants(self) -> None:
         from secp256k1_batch.hybrid import split_counts
 
@@ -215,6 +238,29 @@ class HybridBackendTests(unittest.TestCase):
         # On machines without a GPU the hybrid backend degrades to CPU-only.
         data = generate_public_keys(11, 300, backend="hybrid", cpu_share=1.0)
         self.assertEqual(list(iter_keys(data)), R.public_keys_range(11, 300))
+
+    def test_hybrid_shared_buffer_path(self) -> None:
+        # When the GPU backend can write into a caller buffer, both shares land
+        # in one allocation (no final concatenation copy).
+        from secp256k1_batch.hybrid import HybridBackend, split_counts
+
+        stub = self._SharedGPU()
+        backend = HybridBackend(gpu=stub, cpu_share=0.25, cpu_threads=2, calibrate=False)
+        for start, count, compressed in ((1, 1000, False), (999, 1005, True)):
+            before = len(stub.calls)
+            data = backend.generate(start, count, compressed)
+            stride = 33 if compressed else 64
+            self.assertEqual(len(data), count * stride)
+            self.assertEqual(stub.allocated, count * stride)
+            n_cpu, n_gpu = split_counts(count, backend.cpu_share)
+            self.assertEqual(stub.calls[before:], [(start + n_cpu, n_gpu, compressed)])
+            if compressed:
+                pts = R.public_keys_range(start, count)
+                for i, (prefix, x) in enumerate(iter_keys(data, compressed=True)):
+                    self.assertEqual(prefix, 0x02 | (pts[i][1] & 1))
+                    self.assertEqual(x, pts[i][0])
+            else:
+                self.assertEqual(list(iter_keys(data)), R.public_keys_range(start, count))
 
     def test_chunk_ranges(self) -> None:
         from secp256k1_batch.gpu import _chunk_ranges

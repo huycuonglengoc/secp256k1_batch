@@ -15,6 +15,7 @@ per ``grp_size`` value.
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 
@@ -25,7 +26,7 @@ _CSRC_DIR = Path(__file__).parent / "csrc"
 # Bumped whenever the kernel sources or the NVRTC compile options change.  The
 # Colab bootstrap asserts this marker so a stale checkout (failed git update)
 # is caught immediately instead of surfacing as a confusing compiler error.
-GPU_BUILD_VERSION = 9
+GPU_BUILD_VERSION = 10
 
 # grp_size -> compiled RawModule (NVRTC runs at most once per grp_size).
 _COMPILED: dict = {}
@@ -93,6 +94,7 @@ class GPUBackend:
         self.last_path: str | None = None
         self.last_error: str | None = None
         self.copy_mode: str | None = None
+        self.staging: str | None = None
 
     def _load_tables(self):
         from .cpu import build_generator_table
@@ -136,26 +138,33 @@ class GPUBackend:
     def generate(self, start: int, count: int, compressed: bool = False) -> bytes:
         """Return the keys for [start, start+count) as raw bytes.
 
-        With more than one chunk the device-to-host copies run asynchronously on
-        two alternating CUDA streams into pinned host buffers: while chunk N's
-        kernels execute on the GPU, the CPU is already turning chunk N-1 into
-        bytes (or SEC-compressing it).  Any driver/CuPy incompatibility falls
-        back to the simple sequential path, so correctness never depends on the
-        async machinery.
+        The output is staged straight into the host buffer that becomes the
+        return value, so the data crosses the host bus only once:
+
+        * uncompressed -- every device-to-host copy lands in its final position,
+          so only the final ``tobytes()`` touches the data on the host;
+        * compressed -- 64-byte keys are staged in pinned memory and converted
+          to 33-byte SEC form in a single vectorised pass.
+
+        Copies run asynchronously on two alternating CUDA streams, so chunk N's
+        kernels overlap chunk N-1's transfer.  Any driver/CuPy incompatibility
+        falls back to the simple sequential path, so correctness never depends
+        on the async machinery.
         """
         if count == 0:
             return b""
-        self.last_path = None
-        self.last_error = None
-        self.copy_mode = None
+        self._reset_diagnostics()
         ranges = _chunk_ranges(count, self._pipeline_chunk())
-        if len(ranges) == 1:
-            self.last_path = "single"
-            raw = self._generate_chunk(start, count)
-            return _compress(raw) if compressed else raw
+        stride = 33 if compressed else 64
         try:
-            out = self._generate_pipelined(start, ranges, compressed)
-            return out
+            keep, dest = self.alloc_host_buffer(count * stride)
+            try:
+                self._generate_into(start, ranges, compressed, dest, 0)
+                data = dest.tobytes()
+            finally:
+                # Release the pinned owner only after the copy above.
+                del keep
+            return data
         except Exception as exc:
             self.last_path = "sequential"
             self.last_error = f"{type(exc).__name__}: {exc}"
@@ -164,40 +173,119 @@ class GPUBackend:
             )
             return _compress(raw) if compressed else raw
 
-    def _generate_pipelined(self, start: int, ranges, compressed: bool) -> bytes:
+    def generate_into(
+        self, start: int, count: int, compressed: bool, dest, at: int = 0
+    ) -> int:
+        """Write ``count`` keys into ``dest[at:...]``, returning bytes written.
+
+        The hybrid backend uses this so its CPU share and this GPU share land in
+        one host buffer, which removes the final concatenation copy.
+        """
+        if count == 0:
+            return 0
+        ranges = _chunk_ranges(count, self._pipeline_chunk())
+        self._generate_into(start, ranges, compressed, dest, at)
+        return count * (33 if compressed else 64)
+
+    def _reset_diagnostics(self) -> None:
+        self.last_path = None
+        self.last_error = None
+        self.copy_mode = None
+        self.staging = None
+
+    def _generate_into(self, start: int, ranges, compressed: bool, dest, at: int) -> None:
+        if compressed:
+            self._stream_compressed(start, ranges, dest, at)
+        else:
+            self._stream_raw(start, ranges, dest, at)
+
+    def _stream_raw(self, start: int, ranges, dest, at: int) -> None:
+        """D2H straight into the caller's host buffer (no intermediate copy)."""
         cp = self.cp
         streams = (cp.cuda.Stream(non_blocking=True), cp.cuda.Stream(non_blocking=True))
-        slots: list = [None, None]  # (pinned MemoryPointer, numpy view), ping-pong
-        stride = 33 if compressed else 64
-        out = np.empty(sum(n for _, n in ranges) * stride, dtype=np.uint8)
-        write_at = 0
+        inflight: list = [None, None]  # (stream, device array, working buffers)
+        for i, (offset, n) in enumerate(ranges):
+            nbytes = n * 64
+            s = i & 1
+            stream = streams[s]
+            if inflight[s] is not None:
+                # That stream's copy has landed, so its device buffers may go
+                # back to the (not stream-aware) CuPy pool.
+                inflight[s][0].synchronize()
+                inflight[s] = None
+            with stream:
+                dev, extras = self._launch(start + offset, n, keep=True)
+                self._copy_d2h(dev, dest[at : at + nbytes], nbytes, stream)
+            # Keep every device buffer alive until this stream is synchronized:
+            # the pool would otherwise hand the blocks to the *other* stream
+            # while this chunk's kernels or copy still read them.
+            inflight[s] = (stream, dev, extras)
+            at += nbytes
+        for item in inflight:
+            if item is not None:
+                item[0].synchronize()
+        self.last_path = "pipelined(raw)"
+
+    def _stream_compressed(self, start: int, ranges, dest, at: int) -> None:
+        """64-byte keys staged in pinned memory, converted to 33-byte SEC."""
+        cp = self.cp
+        streams = (cp.cuda.Stream(non_blocking=True), cp.cuda.Stream(non_blocking=True))
+        slots: list = [None, None]  # (pinned memory, view, size), ping-pong
         pending = None
         for i, (offset, n) in enumerate(ranges):
             nbytes = n * 64
-            stream = streams[i & 1]
+            s = i & 1
+            stream = streams[s]
             with stream:
                 dev, extras = self._launch(start + offset, n, keep=True)
-                host = self._pinned_host(slots, i & 1, nbytes)
+                host = self._pinned_host(slots, s, nbytes)
                 self._copy_d2h(dev, host, nbytes, stream)
             if pending is not None:
-                write_at += self._finish_chunk(pending, compressed, out, write_at)
-            # Keep every device buffer of this chunk (`dev`, and the centre
-            # arrays / comb points in `extras`) referenced until its stream has
-            # been synchronized: CuPy's memory pool is not stream-aware and
-            # would otherwise hand the blocks to the next chunk while kernels
-            # or the async copy are still reading them.
+                # Convert the previous chunk while this one's kernel/copy runs.
+                at += self._finish_chunk(pending, True, dest, at)
             pending = (stream, host, nbytes, dev, extras)
         if pending is not None:
-            write_at += self._finish_chunk(pending, compressed, out, write_at)
-        self.last_path = "pipelined"
-        return out.tobytes()
+            at += self._finish_chunk(pending, True, dest, at)
+        self.last_path = "pipelined(compressed)"
+
+    def alloc_host_buffer(self, nbytes: int):
+        """Allocate the final host byte buffer as ``(owner, uint8 view)``.
+
+        Pinned memory makes the D2H copies true DMA transfers (measured ~12.8
+        GB/s on Colab versus ~2.8 GB/s for pageable memory), so it is used
+        whenever the buffer fits the pinned budget; otherwise the copies still
+        work, just slower.
+        """
+        nbytes = int(nbytes)
+        if nbytes <= self._pinned_budget():
+            try:
+                mem = self.cp.cuda.alloc_pinned_memory(nbytes)
+                self.staging = "pinned"
+                return mem, _host_view(mem, nbytes)
+            except Exception:
+                pass
+        self.staging = "pageable"
+        return None, np.empty(nbytes, dtype=np.uint8)
+
+    def _pinned_budget(self) -> int:
+        """How much host memory we are willing to lock for the output buffer.
+
+        Pinned RAM cannot be swapped, so stay well below the machine's free
+        memory: a 50M-key uncompressed run needs 3.2 GB and Colab has ~12 GB.
+        """
+        limit = 4 << 30
+        try:
+            avail = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+            limit = min(limit, int(avail * 0.4))
+        except Exception:
+            pass
+        return max(64 << 20, limit)
 
     def _copy_d2h(self, dev, host: np.ndarray, nbytes: int, stream) -> None:
-        """Async device->host copy into pinned memory (three API fallbacks).
+        """Async device->host copy (three API fallbacks).
 
-        ``host`` must be a pinned uint8 view of exactly ``nbytes`` bytes so the
-        copy is a true DMA transfer that can overlap with the next chunk's
-        kernels.  Only the last resort is synchronous.
+        With a pinned ``host`` this is a true DMA transfer that can overlap the
+        next chunk's kernels.  Only the last resort is synchronous.
         """
         rt = self.cp.cuda.runtime
         try:
@@ -232,19 +320,17 @@ class GPUBackend:
 
     @staticmethod
     def _pinned_host(slots, idx: int, nbytes: int):
-        slot = slots[idx]
-        if slot is None or slot[0].nbytes < nbytes:
-            import ctypes
+        """Return a pinned uint8 view of ``nbytes`` bytes, reusing ``slots[idx]``.
 
+        CuPy's pinned pointers expose no size attribute, so the size is tracked
+        in the slot tuple.
+        """
+        slot = slots[idx]
+        if slot is None or slot[2] < nbytes:
             import cupy as cp
 
             mem = cp.cuda.alloc_pinned_memory(nbytes)
-            try:
-                host = np.frombuffer(mem, dtype=np.uint8, count=nbytes)
-            except Exception:  # MemoryPointer without buffer-protocol support
-                buf = (ctypes.c_uint8 * nbytes).from_address(int(mem.ptr))
-                host = np.frombuffer(buf, dtype=np.uint8)
-            slot = (mem, host)
+            slot = (mem, _host_view(mem, nbytes), nbytes)
             slots[idx] = slot
         return slot[1][:nbytes]
 
@@ -427,6 +513,17 @@ class GPUBackend:
 def _chunk_ranges(count: int, chunk: int):
     """Split [0, count) into ``(offset, n)`` ranges of at most ``chunk`` keys."""
     return [(offset, min(chunk, count - offset)) for offset in range(0, count, chunk)]
+
+
+def _host_view(mem, nbytes: int) -> np.ndarray:
+    """A uint8 numpy view over host memory (pinned pointer or byte buffer)."""
+    import ctypes
+
+    try:
+        return np.frombuffer(mem, dtype=np.uint8, count=nbytes)
+    except Exception:  # MemoryPointer without buffer-protocol support
+        buf = (ctypes.c_uint8 * nbytes).from_address(int(mem.ptr))
+        return np.frombuffer(buf, dtype=np.uint8)
 
 
 def _compress(uncompressed) -> bytes:

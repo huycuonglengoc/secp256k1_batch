@@ -32,6 +32,8 @@ import os
 import threading
 import time
 
+import numpy as np
+
 # Below this many keys the split costs more than it saves (thread spawn, extra
 # table/setup work); let the GPU do the whole range.
 _MIN_SPLIT_COUNT = 1 << 18  # 262144 keys
@@ -131,28 +133,55 @@ class HybridBackend:
         if n_cpu == 0 or n_gpu == 0:
             return self.gpu.generate(start, count, compressed)
 
-        # CPU takes the first part, GPU the rest: results stay contiguous and the
-        # GPU (the long-running side) starts immediately at its own range.
+        # CPU takes the first part, GPU the rest.  When the GPU backend can write
+        # into a caller-provided buffer, both shares land in ONE host buffer, so
+        # the final ``tobytes()`` is the only pass over the whole output (a
+        # ``cpu_bytes + gpu_bytes`` concatenation would copy everything again).
+        stride = 33 if compressed else 64
+        shared = hasattr(self.gpu, "generate_into") and hasattr(
+            self.gpu, "alloc_host_buffer"
+        )
+        if shared:
+            try:
+                keep, dest = self.gpu.alloc_host_buffer(count * stride)
+            except Exception:  # e.g. not enough free RAM for the pinned buffer
+                shared, keep, dest = False, None, None
+            cpu_at = n_cpu * stride if shared else 0
+        else:
+            keep, dest, cpu_at = None, None, 0
         result: dict = {}
 
         def _cpu_worker() -> None:
             try:
-                result["data"] = self.cpu.generate(
+                data = self.cpu.generate(
                     start, n_cpu, compressed, nthreads=self.cpu_threads
                 )
+                if dest is None:
+                    result["data"] = data
+                else:
+                    dest[:cpu_at] = np.frombuffer(data, dtype=np.uint8)
             except BaseException as exc:  # propagate to the caller
                 result["error"] = exc
 
         worker = threading.Thread(target=_cpu_worker, name="secp256k1-cpu-share", daemon=True)
         worker.start()
         try:
-            gpu_part = self.gpu.generate(start + n_cpu, n_gpu, compressed)
+            if shared:
+                self.gpu.generate_into(start + n_cpu, n_gpu, compressed, dest, cpu_at)
+            else:
+                result["gpu"] = self.gpu.generate(start + n_cpu, n_gpu, compressed)
         finally:
             worker.join()
 
         if "error" in result:
             raise result["error"]
-        return result["data"] + gpu_part
+        if not shared:
+            return result["data"] + result["gpu"]
+        # Materialise before releasing the pinned owner (the numpy view may not
+        # keep the pinned allocation alive).
+        data = dest.tobytes()
+        del keep
+        return data
 
     def iter_chunks(
         self,

@@ -77,10 +77,14 @@ Two pipelines hide the serial costs:
   or CuPy incompatibility falls back to the simple sequential path, so
   correctness never depends on the async machinery.
 * **CPU/GPU overlap** — the CPU share of the range runs in a worker thread
-  (ctypes releases the GIL) while the main thread drives the GPU.
+  (ctypes releases the GIL) while the main thread drives the GPU. Both shares
+  are written into **one** host buffer (the GPU's D2H copies land at the CPU
+  share's offset), so the final `tobytes()` is the only pass over the whole
+  output — a `cpu_bytes + gpu_bytes` concatenation would copy everything again
+  and would cost more than the CPU contributes.
 
 The CPU share is calibrated once (`~100k` CPU keys, `2M` GPU keys) and is
-`rate_cpu / (rate_cpu + rate_gpu)`; it is capped at 50% and skipped for ranges
+`rate_cpu / (rate_cpu + rate_gpu)`; it is capped at 25% and skipped for ranges
 under ~262k keys, where the split costs more than it saves. With no GPU the
 backend degrades to pure CPU.
 
@@ -151,9 +155,20 @@ holds more than one chunk at a time.
 * CPU `--nthreads`: sets OpenMP threads (Colab: use the CPU core count).
 
 Note: `generate_public_keys` returns the keys as bytes, so the end-to-end rate
-for very large counts is ultimately bounded by PCIe/device-to-host transfer,
-not by the kernel. The kernel itself runs substantially faster than the
-transfer; benchmark it directly with CUDA events if you want the raw GPU rate.
+for large counts is bounded by host memory, not by the kernel. Two things make
+that path as cheap as possible:
+
+* **one host pass.** The uncompressed output is staged directly into the buffer
+  that becomes the return value (pinned when it fits ~4 GiB / 40% of free RAM),
+  so only the final `tobytes()` touches the data. Compressed keys need one
+  conversion pass (64 B/key → 33 B/key).
+* **async copies.** D2H runs on two alternating CUDA streams, so chunk N's
+  kernels overlap chunk N-1's transfer. Measured on Colab: pinned D2H ~12.8 GB/s
+  versus ~2.8 GB/s pageable, while a plain host `tobytes()` is ~1.6 GB/s.
+
+That last number is the real ceiling of a bytes-returning API: producing 3.2 GB
+of `bytes` costs about 2 s no matter how fast the GPU is. Use
+`iter_public_key_chunks` (or the CLI `-o` path) to skip it when streaming.
 
 ## Correctness
 
