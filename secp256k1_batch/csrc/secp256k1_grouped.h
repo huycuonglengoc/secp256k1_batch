@@ -105,14 +105,21 @@ SECP_INLINE void secp_batch_invert(uint64_t *z, uint64_t *prefix, int count) {
     }
 }
 
-/* Write a 4-limb (little-endian) field element as 32 big-endian bytes. */
+/* Write a 4-limb (little-endian) field element as 32 big-endian bytes, via
+ * four byte-swapped 64-bit stores.  `byte_off` must be 8-byte aligned (the
+ * kernel always writes at 64-byte key boundaries).  Eight wide stores per key
+ * instead of 64 byte stores keeps the scattered per-thread writes from
+ * saturating the store pipeline. */
 SECP_INLINE void secp_write_be32(uint8_t *out, uint64_t byte_off, const uint64_t *limbs) {
+    uint64_t *dst = (uint64_t *)(out + byte_off);
     for (int w = 0; w < 4; w++) {
         uint64_t v = limbs[w];
-        for (int b = 7; b >= 0; b--) {
-            out[byte_off + (24 - 8 * w) + b] = (uint8_t)(v & 0xFF);
-            v >>= 8;
-        }
+        /* bswap64: reverse the byte order so little-endian limb w lands at
+         * big-endian word position 3 - w. */
+        v = ((v & 0x00FF00FF00FF00FFULL) << 8) | ((v >> 8) & 0x00FF00FF00FF00FFULL);
+        v = ((v & 0x0000FFFF0000FFFFULL) << 16) | ((v >> 16) & 0x0000FFFF0000FFFFULL);
+        v = (v << 32) | (v >> 32);
+        dst[3 - w] = v;
     }
 }
 

@@ -95,8 +95,8 @@ python3 -m secp256k1_batch.cli --start 1 --count 1000000 --compressed --backend 
 
 * GPU `--grp-size`: keys generated per thread per step (even). Larger values
   amortize the single field inversion over more keys and reduce work per key,
-  but use more local memory and fewer threads for small counts. `1024` is the
-  default; sweep `64`–`2048` for your GPU.
+  but use more local memory (at 1024 the per-thread arrays spill to DRAM and
+  slow down). `128` is the default; sweep `64`–`2048` for your GPU.
 * GPU `--gpu-threads`: target thread count (grid size). The kernel splits the
   range into blocks of `grp_size` keys across up to this many threads.
 * GPU `--gpu-chunk`: bounds device memory; the range is processed in chunks.

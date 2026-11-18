@@ -145,10 +145,10 @@ SECP_INLINE int secp_is_zero(const uint64_t *a) {
  * carry-chained add.cc/addc are tighter than emulated `__int128`.  Only used
  * in device code; the host keeps the portable `__int128` version below. */
 
-#define SECP_MUL_LO(c, a, b) asm volatile("mul.lo.u64 %0, %1, %2;" : "=l"(c) : "l"(a), "l"(b))
-#define SECP_MUL_HI(c, a, b) asm volatile("mul.hi.u64 %0, %1, %2;" : "=l"(c) : "l"(a), "l"(b))
-#define SECP_ADD_CC(c, b) asm volatile("add.cc.u64 %0, %0, %1;" : "+l"(c) : "l"(b))
-#define SECP_ADDC(c, b) asm volatile("addc.cc.u64 %0, %0, %1;" : "+l"(c) : "l"(b))
+#define SECP_MUL_LO(c, a, b) asm volatile("mul.lo.u64 %0, %1, %2;" : "=l"(c) : "l"((uint64_t)(a)), "l"((uint64_t)(b)))
+#define SECP_MUL_HI(c, a, b) asm volatile("mul.hi.u64 %0, %1, %2;" : "=l"(c) : "l"((uint64_t)(a)), "l"((uint64_t)(b)))
+#define SECP_ADD_CC(c, b) asm volatile("add.cc.u64 %0, %0, %1;" : "+l"(c) : "l"((uint64_t)(b)))
+#define SECP_ADDC(c, b) asm volatile("addc.cc.u64 %0, %0, %1;" : "+l"(c) : "l"((uint64_t)(b)))
 
 /* (t, carry) += ai * bj, i.e. t = low64(ai*bj + t + carry), carry = high64. */
 SECP_INLINE void secp_mac(uint64_t &t, uint64_t &carry, uint64_t ai, uint64_t bj) {
@@ -326,7 +326,7 @@ SECP_INLINE void secp_sqr(uint64_t *r, const uint64_t *a) {
  * (Brian Smith's chain, as used by libsecp256k1).  About 267 squarings and
  * 15 multiplications instead of the ~510 field operations of naive Fermat. */
 SECP_INLINE void secp_inv(uint64_t *r, const uint64_t *a) {
-    uint64_t x2[4], x3[4], x7[4], x63[4], x511[4], x2047[4];
+    uint64_t x2[4], x3[4], x63[4], x511[4], x2047[4];
     uint64_t x22[4], x44[4], x88[4], x176[4], x220[4], x223[4];
     uint64_t x14[4], x15[4], x45[4], B[4], C[4], t[4];
     int i;

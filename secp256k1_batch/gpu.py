@@ -43,8 +43,8 @@ def _compiled_module(grp_size: int):
     source = f"#define SECP_GRP_SIZE {grp_size}\n" + source
     # NVRTC requires --device-int128 to enable __int128 in device code; nvcc
     # supports it by default and does not accept that flag.
-    nvrtc_options = ("-I" + str(_CSRC_DIR), "--std=c++11", "--device-int128")
-    nvcc_options = ("-I" + str(_CSRC_DIR), "--std=c++11")
+    nvrtc_options = ("-I" + str(_CSRC_DIR), "--std=c++11", "--device-int128", "-O3")
+    nvcc_options = ("-I" + str(_CSRC_DIR), "--std=c++11", "-O3")
     try:
         module = cp.RawModule(code=source, options=nvrtc_options)
     except Exception:
@@ -59,7 +59,7 @@ class GPUBackend:
     def __init__(
         self,
         device: int = 0,
-        grp_size: int = 1024,
+        grp_size: int = 128,
         threads: int = 32768,
         block: int = 256,
         chunk: int = 1 << 26,

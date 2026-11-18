@@ -73,7 +73,7 @@ def _make_backend(name: str, opts: dict):
 
         backend = GPUBackend(
             device=opts.get("gpu_device", 0),
-            grp_size=opts.get("grp_size", 1024),
+            grp_size=opts.get("grp_size", 128),
             threads=opts.get("gpu_threads", 32768),
             block=opts.get("gpu_block", 256),
             chunk=opts.get("gpu_chunk", 1 << 26),
