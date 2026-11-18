@@ -87,12 +87,12 @@ class HybridBackend:
         else:
             share = 0.02
 
-        # Never give the CPU more than a quarter of the range: the GPU is far
-        # faster at bulk EC generation, and the host threads also have to carry
-        # the D2H copies and output assembly, so an aggressive CPU share would
-        # only add memory-bandwidth contention (measured on Colab: a 24% share
-        # made the 50M-key run slower than GPU-only).
-        limit = 1.0 if self.gpu is None else 0.25
+        # Keep the CPU share small.  The output path is memory-bound, so the
+        # host threads compete with the D2H copies and with materialising the
+        # returned bytes; a large share simply becomes the critical path
+        # (measured on Colab: 25% of a 50M range took the hybrid rate from
+        # 12.2 to 9.0 M keys/s, while ~5-10% is free).
+        limit = 1.0 if self.gpu is None else 0.10
         self.cpu_share = min(max(share, 0.0), limit)
 
     # -- calibration -----------------------------------------------------

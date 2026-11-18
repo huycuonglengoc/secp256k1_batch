@@ -84,9 +84,12 @@ Two pipelines hide the serial costs:
   and would cost more than the CPU contributes.
 
 The CPU share is calibrated once (`~100k` CPU keys, `2M` GPU keys) and is
-`rate_cpu / (rate_cpu + rate_gpu)`; it is capped at 25% and skipped for ranges
-under ~262k keys, where the split costs more than it saves. With no GPU the
-backend degrades to pure CPU.
+`rate_cpu / (rate_cpu + rate_gpu)`; it is capped at 10% and skipped for ranges
+under ~262k keys, where the split costs more than it saves. The cap matters because the output
+path is memory-bound: a larger CPU share competes with the D2H copies and with
+materialising the returned `bytes`, and becomes the critical path. With no GPU
+the backend degrades to pure CPU. Override with `cpu_share=` or
+`--cpu-share` when your machine has spare memory bandwidth.
 
 ```python
 from secp256k1_batch import generate_public_keys
