@@ -24,7 +24,7 @@ _CSRC_DIR = Path(__file__).parent / "csrc"
 # Bumped whenever the kernel sources or the NVRTC compile options change.  The
 # Colab bootstrap asserts this marker so a stale checkout (failed git update)
 # is caught immediately instead of surfacing as a confusing compiler error.
-GPU_BUILD_VERSION = 5
+GPU_BUILD_VERSION = 6
 
 # grp_size -> compiled RawModule (NVRTC runs at most once per grp_size).
 _COMPILED: dict = {}
