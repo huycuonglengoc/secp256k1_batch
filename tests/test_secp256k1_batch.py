@@ -109,6 +109,105 @@ class CPUBackendTests(unittest.TestCase):
         )
 
 
+class HybridBackendTests(unittest.TestCase):
+    """The hybrid split logic is tested with a stub GPU backend (the real one
+    needs CUDA), so range partitioning, ordering and concurrency are covered on
+    any machine."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from secp256k1_batch.cpu import _compiler
+
+        if _compiler() is None:
+            raise unittest.SkipTest("no C compiler available")
+
+    def setUp(self) -> None:
+        from secp256k1_batch import hybrid
+
+        # Exercise the real split path with small ranges (the reference oracle
+        # is pure Python, so keep the key counts tiny).
+        self._saved_min = hybrid._MIN_SPLIT_COUNT
+        hybrid._MIN_SPLIT_COUNT = 100
+
+    def tearDown(self) -> None:
+        from secp256k1_batch import hybrid
+
+        hybrid._MIN_SPLIT_COUNT = self._saved_min
+
+    class _StubGPU:
+        """Behaves like the GPU backend but generates on the CPU (1 thread)."""
+
+        name = "gpu-stub"
+
+        def __init__(self) -> None:
+            from secp256k1_batch.cpu import CPUBackend
+
+            self._cpu = CPUBackend()
+            self.calls: list[tuple[int, int, bool]] = []
+
+        def generate(self, start: int, count: int, compressed: bool = False) -> bytes:
+            self.calls.append((start, count, compressed))
+            return self._cpu.generate(start, count, compressed, nthreads=1)
+
+    def test_split_counts_invariants(self) -> None:
+        from secp256k1_batch.hybrid import split_counts
+
+        for count in (0, 1, 7, 1000, 2**20 - 1):
+            for share in (0.0, 0.01, 0.25, 0.5, 1.0):
+                n_cpu, n_gpu = split_counts(count, share)
+                self.assertEqual(n_cpu + n_gpu, count)
+                self.assertGreaterEqual(n_cpu, 0)
+                self.assertGreaterEqual(n_gpu, 0)
+        # share is clamped to [0, 1]
+        self.assertEqual(split_counts(1000, -1.0), (0, 1000))
+        self.assertEqual(split_counts(1000, 2.0), (1000, 0))
+
+    def test_hybrid_matches_reference(self) -> None:
+        from secp256k1_batch.hybrid import HybridBackend, split_counts
+
+        stub = self._StubGPU()
+        backend = HybridBackend(gpu=stub, cpu_share=0.5, cpu_threads=2, calibrate=False)
+        for start, count in ((1, 1000), (12345, 1001), (0xDEADBEEF, 1000)):
+            before = len(stub.calls)
+            data = backend.generate(start, count)
+            self.assertEqual(len(data), count * 64)
+            self.assertEqual(list(iter_keys(data)), R.public_keys_range(start, count))
+            # The GPU (stub) got exactly the second contiguous half.
+            n_cpu, n_gpu = split_counts(count, backend.cpu_share)
+            self.assertEqual(stub.calls[before:], [(start + n_cpu, n_gpu, False)])
+
+    def test_hybrid_compressed_and_small(self) -> None:
+        from secp256k1_batch.hybrid import HybridBackend
+
+        stub = self._StubGPU()
+        backend = HybridBackend(gpu=stub, cpu_share=0.5, cpu_threads=2, calibrate=False)
+        # Small counts bypass the split entirely (GPU does everything).
+        data = backend.generate(7, 10, compressed=True)
+        self.assertEqual(len(data), 10 * 33)
+        # Larger compressed range: split path with 33-byte output.
+        data = backend.generate(7, 1005, compressed=True)
+        pts = R.public_keys_range(7, 1005)
+        for i, (prefix, x) in enumerate(iter_keys(data, compressed=True)):
+            self.assertEqual(prefix, 0x02 | (pts[i][1] & 1))
+            self.assertEqual(x, pts[i][0])
+
+    def test_hybrid_engine_backend(self) -> None:
+        # On machines without a GPU the hybrid backend degrades to CPU-only.
+        data = generate_public_keys(11, 300, backend="hybrid", cpu_share=1.0)
+        self.assertEqual(list(iter_keys(data)), R.public_keys_range(11, 300))
+
+    def test_chunk_ranges(self) -> None:
+        from secp256k1_batch.gpu import _chunk_ranges
+
+        self.assertEqual(_chunk_ranges(0, 10), [])
+        self.assertEqual(_chunk_ranges(10, 10), [(0, 10)])
+        self.assertEqual(_chunk_ranges(23, 10), [(0, 10), (10, 10), (20, 3)])
+        for count, chunk in ((1, 1), (5, 2), (100, 7)):
+            ranges = _chunk_ranges(count, chunk)
+            self.assertEqual([o for o, _ in ranges], list(range(0, count, chunk)))
+            self.assertEqual(sum(n for _, n in ranges), count)
+
+
 class GPUBackendTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

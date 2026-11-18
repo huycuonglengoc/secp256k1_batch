@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from .constants import N
 
-BACKENDS = ("auto", "gpu", "cpu", "reference")
+BACKENDS = ("auto", "gpu", "cpu", "reference", "hybrid")
 
 
 def _validate(start: int, count: int) -> None:
@@ -79,6 +79,19 @@ def _make_backend(name: str, opts: dict):
             chunk=opts.get("gpu_chunk", 1 << 26),
         )
 
+    elif name == "hybrid":
+        from .hybrid import HybridBackend
+
+        backend = HybridBackend(
+            cpu_share=opts.get("cpu_share"),
+            cpu_threads=opts.get("nthreads", 0),
+            device=opts.get("gpu_device", 0),
+            grp_size=opts.get("grp_size", 128),
+            threads=opts.get("gpu_threads", 32768),
+            block=opts.get("gpu_block", 256),
+            chunk=opts.get("gpu_chunk", 1 << 26),
+        )
+
     else:
         raise ValueError(f"unknown backend {name!r}")
 
@@ -92,7 +105,11 @@ def _resolve_backend(name: str) -> str:
     from .gpu import is_available as gpu_ok
 
     if gpu_ok():
-        return "gpu"
+        # Hybrid keeps the CPU busy with the memory-bound parts (SEC
+        # compression, output assembly) and with its calibrated share of the
+        # range while the GPU runs the kernels; it degrades to GPU-only when
+        # the split is not worth it.
+        return "hybrid"
     # CPU backend needs a C compiler; fall back to the reference otherwise.
     from .cpu import _compiler
 

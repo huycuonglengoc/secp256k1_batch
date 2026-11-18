@@ -28,8 +28,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start", required=True, type=_parse_int, help="first private key (decimal or 0x hex)")
     parser.add_argument("--count", required=True, type=int, help="number of keys to generate")
     parser.add_argument("--compressed", action="store_true", help="emit 33-byte SEC compressed keys")
-    parser.add_argument("--backend", choices=["auto", "gpu", "cpu", "reference"], default="auto")
+    parser.add_argument("--backend", choices=["auto", "gpu", "cpu", "reference", "hybrid"], default="auto")
     parser.add_argument("--nthreads", type=int, default=0, help="CPU OpenMP threads (0 = default)")
+    parser.add_argument("--cpu-share", type=float, default=None, help="hybrid: CPU share of the range (default: calibrated)")
     parser.add_argument("--grp-size", type=int, default=128, help="GPU block size (keys per thread per step, even)")
     parser.add_argument("--gpu-threads", type=int, default=32768, help="GPU thread count target")
     parser.add_argument("--gpu-chunk", type=int, default=1 << 26, help="GPU chunk size (bounds device memory)")
@@ -57,6 +58,7 @@ def main(argv: list[str] | None = None) -> int:
         compressed=args.compressed,
         backend=args.backend,
         nthreads=args.nthreads,
+        cpu_share=args.cpu_share,
         grp_size=args.grp_size,
         gpu_threads=args.gpu_threads,
         gpu_chunk=args.gpu_chunk,

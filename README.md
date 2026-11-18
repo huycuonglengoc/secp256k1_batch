@@ -54,7 +54,41 @@ stride-collision edge case).
 | `gpu`        | CUDA kernel JIT-compiled with CuPy (NVRTC)        | large ranges, a GPU is attached  |
 | `cpu`        | C extension JIT-compiled with `gcc`, optional OpenMP | large ranges, CPU-only runtime   |
 | `reference`  | pure Python (the correctness oracle)              | validation, tiny ranges          |
-| `auto`       | GPU → CPU → reference, whichever is available      | default                          |
+| `hybrid`     | CPU **and** GPU concurrently (see below)          | maximum end-to-end throughput    |
+| `auto`       | `hybrid` when a GPU is present, else CPU → reference | default                       |
+
+## Hybrid CPU+GPU: which sub-problem runs where
+
+The work is decomposed by sub-problem, and each piece runs on the device that
+does it best:
+
+| Sub-problem | Device | Why |
+|---|---|---|
+| Generator table `i·G`, comb table `2^k·(sub·G)` | **CPU** | a handful of latency-bound scalar multiplications — launching kernels for this would only add overhead |
+| Range split / scheduling / calibration | **CPU** | control logic, microseconds of work |
+| SEC compression + output assembly of chunk `N-1` | **CPU** (numpy) | memory-bound and highly vectorizable; it runs *while* the GPU works on chunk `N` |
+| Its calibrated share of the key range (OpenMP, GIL released) | **CPU** | owns otherwise-idle cores; the share is set so both devices finish together |
+| Bulk grouped-affine key generation | **GPU** | massively parallel field arithmetic |
+
+Two pipelines hide the serial costs:
+
+* **GPU side** — chunk `N`'s kernels run on one CUDA stream while chunk `N-1`'s
+  device-to-host copy streams into pinned host memory on the other. Any driver
+  or CuPy incompatibility falls back to the simple sequential path, so
+  correctness never depends on the async machinery.
+* **CPU/GPU overlap** — the CPU share of the range runs in a worker thread
+  (ctypes releases the GIL) while the main thread drives the GPU.
+
+The CPU share is calibrated once (`~100k` CPU keys, `2M` GPU keys) and is
+`rate_cpu / (rate_cpu + rate_gpu)`; it is capped at 50% and skipped for ranges
+under ~262k keys, where the split costs more than it saves. With no GPU the
+backend degrades to pure CPU.
+
+```python
+from secp256k1_batch import generate_public_keys
+generate_public_keys(1, 10_000_000, backend="hybrid")      # CPU + GPU together
+generate_public_keys(1, 10_000_000, backend="hybrid", cpu_share=0.01)  # manual split
+```
 
 ## Install & run on Google Colab
 
