@@ -66,8 +66,9 @@ does it best:
 |---|---|---|
 | Generator table `i·G`, comb table `2^k·(sub·G)` | **CPU** | a handful of latency-bound scalar multiplications — launching kernels for this would only add overhead |
 | Range split / scheduling / calibration | **CPU** | control logic, microseconds of work |
-| SEC compression + output assembly of chunk `N-1` | **CPU** (numpy) | memory-bound and highly vectorizable; it runs *while* the GPU works on chunk `N` |
-| Its calibrated share of the key range (OpenMP, GIL released) | **CPU** | owns otherwise-idle cores; the share is set so both devices finish together |
+| Output buffer allocation, chunk assembly, final `bytes` materialisation | **CPU** | pointer/allocator work that has no GPU equivalent |
+| Opt-in share of the key range (OpenMP, GIL released) | **CPU** | only pays off when the GPU's *compute* is the bottleneck; see below |
+| SEC compression | **GPU** | a tiny kernel turns 64 B keys into 33 B, so the bus carries 48% less |
 | Bulk grouped-affine key generation | **GPU** | massively parallel field arithmetic |
 
 Two pipelines hide the serial costs:
@@ -83,13 +84,26 @@ Two pipelines hide the serial costs:
   output — a `cpu_bytes + gpu_bytes` concatenation would copy everything again
   and would cost more than the CPU contributes.
 
-The CPU share is calibrated once (`~100k` CPU keys, `2M` GPU keys) and is
-`rate_cpu / (rate_cpu + rate_gpu)`; it is capped at 10% and skipped for ranges
-under ~262k keys, where the split costs more than it saves. The cap matters because the output
-path is memory-bound: a larger CPU share competes with the D2H copies and with
-materialising the returned `bytes`, and becomes the critical path. With no GPU
-the backend degrades to pure CPU. Override with `cpu_share=` or
-`--cpu-share` when your machine has spare memory bandwidth.
+### Is a CPU share of the range worth it?
+
+**With a GPU, the default share is 0** — and that is a measurement, not a
+choice of convenience. The output path is memory-bound, so every key the CPU
+generates competes for exactly the bandwidth the GPU path needs. On Colab
+(50M keys, 3.2 GB of output):
+
+| Configuration | Rate |
+|---|---|
+| GPU only | **21.0 M keys/s** |
+| 10% CPU share | 14.5 M keys/s |
+| ~5% CPU share | ≈ GPU-only (the CPU finishes first) |
+
+The CPU is still busy at the parts it does best — building the tables,
+scheduling, allocating and assembling the output, and (when the GPU's compute
+is the bottleneck, e.g. a future on-device hash/bloom scan) generating a share.
+Ask for one explicitly with `cpu_share=0.05` or `--cpu-share 0.05`, or use
+`cpu_share="auto"` for the measured `rate_cpu / (rate_cpu + rate_gpu)` split
+(capped at 10%, skipped below ~262k keys). With no GPU the backend degrades to
+pure CPU.
 
 ```python
 from secp256k1_batch import generate_public_keys

@@ -239,6 +239,36 @@ class HybridBackendTests(unittest.TestCase):
         data = generate_public_keys(11, 300, backend="hybrid", cpu_share=1.0)
         self.assertEqual(list(iter_keys(data)), R.public_keys_range(11, 300))
 
+    def test_default_share_is_gpu_only(self) -> None:
+        # With a GPU the default share is 0: the output path is memory-bound,
+        # so a CPU share only adds traffic.  The GPU must get the whole range.
+        from secp256k1_batch.hybrid import HybridBackend
+
+        stub = self._SharedGPU()
+        backend = HybridBackend(gpu=stub)
+        self.assertEqual(backend.cpu_share, 0.0)
+        data = backend.generate(1, 500)
+        self.assertEqual(stub.calls, [(1, 500, False)])
+        self.assertEqual(list(iter_keys(data)), R.public_keys_range(1, 500))
+
+    def test_auto_share_uses_calibration(self) -> None:
+        from secp256k1_batch import hybrid
+
+        saved = hybrid.HybridBackend._calibrate
+        hybrid.HybridBackend._calibrate = lambda self: 0.05
+        try:
+            backend = hybrid.HybridBackend(gpu=self._SharedGPU(), cpu_share="auto")
+            self.assertAlmostEqual(backend.cpu_share, 0.05)
+        finally:
+            hybrid.HybridBackend._calibrate = saved
+        # And the share is still capped.
+        hybrid.HybridBackend._calibrate = lambda self: 0.9
+        try:
+            backend = hybrid.HybridBackend(gpu=self._SharedGPU(), cpu_share="auto")
+            self.assertAlmostEqual(backend.cpu_share, 0.10)
+        finally:
+            hybrid.HybridBackend._calibrate = saved
+
     def test_hybrid_shared_buffer_path(self) -> None:
         # When the GPU backend can write into a caller buffer, both shares land
         # in one allocation (no final concatenation copy).
