@@ -5,7 +5,11 @@ import unittest
 
 from secp256k1_batch import constants as C
 from secp256k1_batch import reference as R
-from secp256k1_batch.engine import generate_public_keys, iter_keys
+from secp256k1_batch.engine import (
+    generate_public_keys,
+    iter_keys,
+    iter_public_key_chunks,
+)
 
 
 class ReferenceTests(unittest.TestCase):
@@ -56,6 +60,22 @@ class EngineTests(unittest.TestCase):
             generate_public_keys(C.N, 5, backend="reference")
         with self.assertRaises(ValueError):
             generate_public_keys(1, -1, backend="reference")
+
+    def test_package_exports(self) -> None:
+        # Every advertised name must actually import from the package root
+        # (regression: iter_public_key_chunks lived only in engine.py).
+        import secp256k1_batch as pkg
+
+        for name in pkg.__all__:
+            self.assertTrue(hasattr(pkg, name), f"missing export: {name}")
+        self.assertIs(pkg.iter_public_key_chunks, iter_public_key_chunks)
+
+    def test_streaming_chunks_match_full(self) -> None:
+        start, count = 3, 100
+        full = generate_public_keys(start, count, backend="reference")
+        parts = list(iter_public_key_chunks(start, count, backend="reference", chunk=7))
+        self.assertEqual(b"".join(parts), full)
+        self.assertEqual(len(parts), 15)  # ceil(100 / 7)
 
 
 class CPUBackendTests(unittest.TestCase):

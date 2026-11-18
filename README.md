@@ -124,6 +124,21 @@ python3 -m secp256k1_batch.cli --start 1 --count 1000000 -o pubkeys.hex
 python3 -m secp256k1_batch.cli --start 1 --count 1000000 --compressed --backend cpu --nthreads 8 -o pubkeys.hex
 ```
 
+Streaming (constant RAM, no final full-range copy):
+
+```python
+from secp256k1_batch import iter_public_key_chunks
+
+with open("pubkeys.bin", "wb") as handle:
+    for part in iter_public_key_chunks(1, 1_000_000_000, backend="hybrid"):
+        handle.write(part)
+```
+
+`iter_public_key_chunks` yields contiguous chunks (64 B/key uncompressed,
+33 B/key compressed) and is what the CLI `-o` path uses; on the GPU backend the
+chunks are copied into pinned host buffers asynchronously, so the host never
+holds more than one chunk at a time.
+
 ## Tuning
 
 * GPU `--grp-size`: keys generated per thread per step (even). Larger values

@@ -6,11 +6,12 @@ CPU backend, a CUDA GPU backend, or a pure-Python reference implementation.
 """
 
 from .constants import GX, GY, N, P
-from .engine import generate_public_keys, iter_keys
+from .engine import generate_public_keys, iter_keys, iter_public_key_chunks
 
 __all__ = [
     "generate_public_keys",
     "iter_keys",
+    "iter_public_key_chunks",
     "P",
     "N",
     "GX",
