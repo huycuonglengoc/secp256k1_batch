@@ -29,16 +29,24 @@ scanners such as VanitySearch / KeyHunt (which reach ~1 Gkeys/s on an L4 and
   key then costs just **one multiplication + one squaring + a few subtractions**
   (≈2–3 field multiplications), versus ~11 for a Jacobian mixed addition.
 * **No per-key scalar multiplication.** Only the block centres need a scalar
-  multiplication, computed once in a cheap setup kernel — the hot loop is pure
-  point addition.
-* **256-bit modular arithmetic on 64×64→128-bit products** (`unsigned __int128`),
-  with the secp256k1-specific reduction `2²⁵⁶ ≡ 2³² + 977 (mod p)`, and a
-  257-bit→256-bit scalar reduction modulo the group order `n`.
+  multiplication, and even those are computed with a **comb method**: the host
+  builds a 32-point table `2^k·(sub·G)` once, and each thread's centre is at
+  most 32 (avg ~16) point additions instead of a full 256-doubling scalar
+  multiplication.
+* **PTX inline-asm field arithmetic.** The 64×64→128-bit multiply-accumulate hot
+  path uses native `mul.lo.u64`/`mul.hi.u64`/`add.cc`/`addc.cc` PTX (the same
+  technique as KeyHunt's `GPUMath.h`), with the secp256k1 reduction
+  `2²⁵⁶ ≡ 2³² + 977 (mod p)`.
+* **Addition-chain inversion and symmetric squaring.** `secp_inv` uses Brian
+  Smith's addition chain for `p − 2` (~267 squarings + 15 multiplications, ≈2.2×
+  faster than Fermat), and `secp_sqr` exploits the `aᵢaⱼ = aⱼaᵢ` symmetry
+  (10 products instead of 16).
 
 The correctness-critical field/point helpers (`csrc/secp256k1_field.h`,
 `csrc/secp256k1_point.h`, `csrc/secp256k1_grouped.h`) are compiled for **both**
 the CPU and the GPU and cross-validated against the pure-Python reference and a
-CPU mirror of the exact grouped algorithm.
+CPU mirror of the exact grouped algorithm (including the comb setup and the
+stride-collision edge case).
 
 ## Backends
 
@@ -87,8 +95,8 @@ python3 -m secp256k1_batch.cli --start 1 --count 1000000 --compressed --backend 
 
 * GPU `--grp-size`: keys generated per thread per step (even). Larger values
   amortize the single field inversion over more keys and reduce work per key,
-  but use more local memory and fewer threads for small counts. `256` is a good
-  default; sweep `64`–`1024` for your GPU.
+  but use more local memory and fewer threads for small counts. `1024` is the
+  default; sweep `64`–`2048` for your GPU.
 * GPU `--gpu-threads`: target thread count (grid size). The kernel splits the
   range into blocks of `grp_size` keys across up to this many threads.
 * GPU `--gpu-chunk`: bounds device memory; the range is processed in chunks.

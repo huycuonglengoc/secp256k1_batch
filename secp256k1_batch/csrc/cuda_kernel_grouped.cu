@@ -16,26 +16,25 @@
 #include "secp256k1_point.h"
 #include "secp256k1_grouped.h"
 
-/* centre_j = (start + j*sub + HSIZE) * G, in affine coordinates. */
+/* centre_j = base + sum_{k: bit_k(j)=1} jtable[k], in affine coordinates.
+ * base = (start + hsize) * G, jtable[k] = 2^k * (sub * G).  No per-thread
+ * scalar multiplication: at most 32 mixed point additions (avg ~16). */
 extern "C" __global__ void secp256k1_setup_kernel(
-    const uint64_t s0, const uint64_t s1, const uint64_t s2, const uint64_t s3,
-    const uint64_t sub, uint64_t *cx, uint64_t *cy, const uint64_t T) {
+    const uint64_t *base, const uint64_t *jtable,
+    uint64_t *cx, uint64_t *cy, const uint64_t T) {
     const uint64_t j = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= T) return;
 
-    uint64_t k[4] = {s0, s1, s2, s3};
-    unsigned __int128 carry = (unsigned __int128)j * (unsigned __int128)sub + SECP_HSIZE;
-    for (int i = 0; i < 4; i++) {
-        unsigned __int128 t = (unsigned __int128)k[i] + (uint64_t)carry;
-        k[i] = (uint64_t)t;
-        carry = t >> 64;
+    secp_pt acc;
+    secp_pt_set_inf(&acc);
+    secp_pt_add_affine(&acc, &acc, base, base + 4);
+    for (int k = 0; k < 32; k++) {
+        if ((j >> k) & 1ULL) {
+            secp_pt_add_affine(&acc, &acc, jtable + 8 * k, jtable + 8 * k + 4);
+        }
     }
-    secp_mod_n(k, (uint64_t)carry);
-
-    secp_pt p;
-    secp_scalar_mult(&p, k);
     uint64_t x[4], y[4];
-    secp_pt_to_affine(x, y, &p);
+    secp_pt_to_affine(x, y, &acc);
     for (int w = 0; w < 4; w++) { cx[j * 4 + w] = x[w]; cy[j * 4 + w] = y[w]; }
 }
 

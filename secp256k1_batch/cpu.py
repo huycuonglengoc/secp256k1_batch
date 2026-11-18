@@ -118,6 +118,47 @@ def build_generator_table(grp_size: int):
     return gx, gy, sx, sy, s2x, s2y
 
 
+def build_comb_table(start: int, sub: int, hsize: int):
+    """Build the comb points the GPU setup kernel needs to compute each thread's
+    affine centre without a per-thread scalar multiplication.
+
+    Returns ``(base_x, base_y, jtable)`` as little-endian ``uint64`` numpy
+    arrays: ``base`` = ``(start + hsize) * G`` (4 limbs each), ``jtable`` holds
+    32 points ``2^k * (sub * G)`` (``x||y``, 8 limbs each).
+    """
+    import numpy as np
+
+    from .constants import to_limbs
+
+    lib = ctypes.CDLL(str(_build_library()))
+    lib.secp256k1_build_comb.argtypes = [
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.c_uint64,
+    ]
+    lib.secp256k1_build_comb.restype = ctypes.c_int
+
+    start_limbs = np.asarray(to_limbs(start), dtype=np.uint64)
+    sub_limbs = np.asarray(to_limbs(sub), dtype=np.uint64)
+    base_x = np.zeros(4, dtype=np.uint64)
+    base_y = np.zeros(4, dtype=np.uint64)
+    jtable = np.zeros(32 * 8, dtype=np.uint64)
+    rc = lib.secp256k1_build_comb(
+        base_x.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+        base_y.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+        jtable.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+        start_limbs.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+        sub_limbs.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+        ctypes.c_uint64(hsize),
+    )
+    if rc != 0:
+        raise RuntimeError(f"secp256k1_build_comb failed with code {rc}")
+    return base_x, base_y, jtable
+
+
 class CPUBackend:
     """Generates public keys for a contiguous private-key range on the CPU."""
 

@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "secp256k1_point.h"
+#include "secp256k1_grouped.h"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -128,6 +129,63 @@ int secp256k1_build_table(uint64_t *gx, uint64_t *gy,
     secp_pt_to_affine(stride2_x, stride2_y, &str2);
 
     free(pts); free(zs); free(work);
+    return 0;
+}
+
+/* ---- comb table for the grouped GPU setup kernel ------------------------- */
+
+/* Build (on the host) the points the GPU setup kernel needs to compute each
+ * thread's affine centre without a per-thread scalar multiplication:
+ *
+ *   base   = (start + hsize) * G          (affine, 4 limbs x||y)
+ *   jtable[k] = 2^k * (sub * G)           (affine, 4 limbs x||y), k = 0..31
+ *
+ * Thread j's centre is then  base + sum_{k: bit_k(j)=1} jtable[k], which is
+ * (start + j*sub + hsize) * G.  The caller allocates base_x/base_y with 4
+ * uint64_t each and jtable with 32 * 8 uint64_t.  Returns 0 on success. */
+int secp256k1_build_comb(uint64_t *base_x, uint64_t *base_y, uint64_t *jtable,
+                         const uint64_t *start, const uint64_t *sub,
+                         uint64_t hsize) {
+    uint64_t k[4] = {start[0], start[1], start[2], start[3]};
+    unsigned __int128 carry = (unsigned __int128)k[0] + hsize;
+    k[0] = (uint64_t)carry; carry >>= 64;
+    carry = (unsigned __int128)k[1] + (uint64_t)carry;
+    k[1] = (uint64_t)carry; carry >>= 64;
+    carry = (unsigned __int128)k[2] + (uint64_t)carry;
+    k[2] = (uint64_t)carry; carry >>= 64;
+    carry = (unsigned __int128)k[3] + (uint64_t)carry;
+    k[3] = (uint64_t)carry; carry >>= 64;
+    secp_mod_n(k, (uint64_t)carry);
+
+    secp_pt base_pt, jump_pt;
+    secp_scalar_mult(&base_pt, k);    /* base = (start + hsize) * G */
+    secp_scalar_mult(&jump_pt, sub);  /* jump = sub * G (wraps mod n) */
+
+    /* 33 Jacobian points: base, jump, 2*jump, ..., 2^31*jump.  Convert them
+     * all to affine with a single batch inversion. */
+    secp_pt pts[33];
+    uint64_t zs[33 * 4], work[33 * 8];
+    pts[0] = base_pt;
+    pts[1] = jump_pt;
+    for (int i = 2; i < 33; i++) secp_pt_double(&pts[i], &pts[i - 1]);
+    for (int i = 0; i < 33; i++)
+        memcpy(zs + 4 * i, pts[i].z, 4 * sizeof(uint64_t));
+    batch_invert_impl(zs, work, 33);
+
+    {
+        uint64_t zinv[4], zinv2[4], zinv3[4];
+        memcpy(zinv, zs, 4 * sizeof(uint64_t));
+        secp_sqr(zinv2, zinv); secp_mul(zinv3, zinv2, zinv);
+        secp_mul(base_x, pts[0].x, zinv2);
+        secp_mul(base_y, pts[0].y, zinv3);
+    }
+    for (int i = 0; i < 32; i++) {
+        uint64_t zinv[4], zinv2[4], zinv3[4];
+        memcpy(zinv, zs + 4 * (i + 1), 4 * sizeof(uint64_t));
+        secp_sqr(zinv2, zinv); secp_mul(zinv3, zinv2, zinv);
+        secp_mul(jtable + 8 * i, pts[i + 1].x, zinv2);
+        secp_mul(jtable + 8 * i + 4, pts[i + 1].y, zinv3);
+    }
     return 0;
 }
 

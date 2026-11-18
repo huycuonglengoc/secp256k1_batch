@@ -78,15 +78,14 @@ SECP_INLINE void secp_pt_double(secp_pt *r, const secp_pt *p) {
     secp_add(r->z, r->z, r->z); /* Z3 = 2*Y*Z */
 }
 
-/* r = p + G, where p is Jacobian and G is the affine generator.
+/* r = p + Q, where p is Jacobian and Q = (qx, qy) is affine.
  * Mixed addition (madd-2004-hmv). Aliasing-safe: r may equal p. */
-SECP_INLINE void secp_pt_add_generator(secp_pt *r, const secp_pt *p) {
+SECP_INLINE void secp_pt_add_affine(secp_pt *r, const secp_pt *p,
+                                    const uint64_t *qx, const uint64_t *qy) {
     uint64_t X1[4], Y1[4], Z1[4];
     for (int i = 0; i < 4; i++) { X1[i] = p->x[i]; Y1[i] = p->y[i]; Z1[i] = p->z[i]; }
-    /* Read the generator into local (generic-address-space) arrays so the
-     * __constant__ SECP_GX/SECP_GY can be passed through plain pointers. */
     uint64_t gx[4], gy[4];
-    for (int i = 0; i < 4; i++) { gx[i] = SECP_GX[i]; gy[i] = SECP_GY[i]; }
+    for (int i = 0; i < 4; i++) { gx[i] = qx[i]; gy[i] = qy[i]; }
 
     if (secp_is_zero(Z1)) {
         for (int i = 0; i < 4; i++) { r->x[i] = gx[i]; r->y[i] = gy[i]; }
@@ -143,6 +142,14 @@ SECP_INLINE void secp_pt_add_generator(secp_pt *r, const secp_pt *p) {
     secp_sqr(t, t);           /* (Z1+H)^2 */
     secp_sub(t, t, Z1Z1);     /* - Z1Z1 */
     secp_sub(r->z, t, HH);    /* Z3 = (Z1+H)^2 - Z1Z1 - HH */
+}
+
+/* r = p + G, the affine generator (thin wrapper around secp_pt_add_affine that
+ * reads G from __constant__ memory). */
+SECP_INLINE void secp_pt_add_generator(secp_pt *r, const secp_pt *p) {
+    uint64_t gx[4], gy[4];
+    for (int i = 0; i < 4; i++) { gx[i] = SECP_GX[i]; gy[i] = SECP_GY[i]; }
+    secp_pt_add_affine(r, p, gx, gy);
 }
 
 /* r = k * G. Double-and-add over the 256-bit scalar. */

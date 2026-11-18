@@ -19,8 +19,6 @@ from pathlib import Path
 
 import numpy as np
 
-from .constants import to_limbs
-
 _CSRC_DIR = Path(__file__).parent / "csrc"
 
 # grp_size -> compiled RawModule (NVRTC runs at most once per grp_size).
@@ -61,7 +59,7 @@ class GPUBackend:
     def __init__(
         self,
         device: int = 0,
-        grp_size: int = 256,
+        grp_size: int = 1024,
         threads: int = 32768,
         block: int = 256,
         chunk: int = 1 << 26,
@@ -83,6 +81,7 @@ class GPUBackend:
         self._setup = module.get_function("secp256k1_setup_kernel")
         self._main = module.get_function("secp256k1_grouped_kernel")
         self._gx, self._gy, self._stride = self._load_tables()
+        self._comb_cache: dict = {}
 
     def _load_tables(self):
         from .cpu import build_generator_table
@@ -91,6 +90,21 @@ class GPUBackend:
         stride = np.concatenate([sx, sy, s2x, s2y]).astype(np.uint64)
         cp = self.cp
         return cp.asarray(gx), cp.asarray(gy), cp.asarray(stride)
+
+    def _comb_points(self, start: int, sub: int, hsize: int):
+        """Build (and cache) the device comb points for the setup kernel."""
+        key = (start, sub, hsize)
+        cached = self._comb_cache.get(key)
+        if cached is not None:
+            return cached
+        from .cpu import build_comb_table
+
+        base_x, base_y, jtable = build_comb_table(start, sub, hsize)
+        cp = self.cp
+        base = cp.asarray(np.concatenate([base_x, base_y]).astype(np.uint64))
+        jt = cp.asarray(jtable)
+        self._comb_cache = {key: (base, jt)}
+        return base, jt
 
     @property
     def name(self) -> str:
@@ -114,6 +128,7 @@ class GPUBackend:
         """Run setup + main kernels, returning the (uncompressed) device array."""
         cp = self.cp
         grp = self.grp_size
+        hsize = grp // 2
         blocks = (n + grp - 1) // grp
         T = min(blocks, self.target_threads)
         steps = (blocks + T - 1) // T
@@ -123,15 +138,14 @@ class GPUBackend:
         cx = cp.empty(T * 4, dtype=cp.uint64)
         cy = cp.empty(T * 4, dtype=cp.uint64)
 
-        s0, s1, s2, s3 = to_limbs(start)
+        base, jtable = self._comb_points(start, sub, hsize)
         grid = (T + self.block - 1) // self.block
         block = self.block
 
         self._setup(
             (grid,),
             (block,),
-            (np.uint64(s0), np.uint64(s1), np.uint64(s2), np.uint64(s3),
-             np.uint64(sub), cx, cy, np.uint64(T)),
+            (base, jtable, cx, cy, np.uint64(T)),
         )
         self._main(
             (grid,),
