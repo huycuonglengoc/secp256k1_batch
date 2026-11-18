@@ -30,8 +30,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--compressed", action="store_true", help="emit 33-byte SEC compressed keys")
     parser.add_argument("--backend", choices=["auto", "gpu", "cpu", "reference"], default="auto")
     parser.add_argument("--nthreads", type=int, default=0, help="CPU OpenMP threads (0 = default)")
-    parser.add_argument("--keys-per-thread", type=int, default=64, help="GPU keys per thread")
-    parser.add_argument("--gpu-chunk", type=int, default=1 << 22, help="GPU chunk size (bounds device memory)")
+    parser.add_argument("--grp-size", type=int, default=256, help="GPU block size (keys per thread per step, even)")
+    parser.add_argument("--gpu-threads", type=int, default=32768, help="GPU thread count target")
+    parser.add_argument("--gpu-chunk", type=int, default=1 << 26, help="GPU chunk size (bounds device memory)")
     parser.add_argument("--gpu-device", type=int, default=0)
     parser.add_argument("-o", "--output", help="output file (default: stdout)")
     parser.add_argument("--format", choices=["hex", "bin"], default="hex")
@@ -56,7 +57,8 @@ def main(argv: list[str] | None = None) -> int:
         compressed=args.compressed,
         backend=args.backend,
         nthreads=args.nthreads,
-        keys_per_thread=args.keys_per_thread,
+        grp_size=args.grp_size,
+        gpu_threads=args.gpu_threads,
         gpu_chunk=args.gpu_chunk,
         gpu_device=args.gpu_device,
     )

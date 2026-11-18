@@ -80,6 +80,57 @@ static void batch_invert_impl(uint64_t *z, uint64_t *work, size_t count) {
     }
 }
 
+/* ---- generator table for the grouped GPU kernel --------------------------- */
+
+/* Build (on the host) the affine generator table used by the grouped GPU
+ * kernel:
+ *   gx[i], gy[i] = (i+1)*G       for i = 0 .. grp_size/2 - 1
+ *   stride_x/y   = grp_size * G
+ *   stride2_x/y  = 2 * grp_size * G   (used when the block centre equals stride,
+ *                                      i.e. the delta (stride - centre).x is 0)
+ * The caller allocates gx/gy with grp_size/2 * 4 uint64_t each, and
+ * stride_x/y/stride2_x/stride2_y with 4 uint64_t each.  Returns 0 on success. */
+int secp256k1_build_table(uint64_t *gx, uint64_t *gy,
+                          uint64_t *stride_x, uint64_t *stride_y,
+                          uint64_t *stride2_x, uint64_t *stride2_y,
+                          uint64_t grp_size) {
+    if (grp_size < 2 || (grp_size & 1)) return 1;
+    uint64_t n = grp_size / 2;
+    secp_pt *pts = (secp_pt *)malloc((size_t)n * sizeof(secp_pt));
+    uint64_t *zs = (uint64_t *)malloc((size_t)n * 4 * sizeof(uint64_t));
+    uint64_t *work = (uint64_t *)malloc((size_t)n * 8 * sizeof(uint64_t));
+    if (!pts || !zs || !work) { free(pts); free(zs); free(work); return 2; }
+
+    secp_pt acc;
+    secp_pt_set_inf(&acc);
+    for (uint64_t i = 0; i < n; i++) {
+        secp_pt_add_generator(&acc, &acc); /* acc = (i+1)*G */
+        pts[i] = acc;
+    }
+    for (uint64_t i = 0; i < n; i++)
+        memcpy(zs + 4 * i, pts[i].z, 4 * sizeof(uint64_t));
+    batch_invert_impl(zs, work, n);
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t x[4], y[4], zinv[4], zinv2[4], zinv3[4];
+        memcpy(zinv, zs + 4 * i, 4 * sizeof(uint64_t));
+        secp_sqr(zinv2, zinv);
+        secp_mul(zinv3, zinv2, zinv);
+        secp_mul(x, pts[i].x, zinv2);
+        secp_mul(y, pts[i].y, zinv3);
+        memcpy(gx + 4 * i, x, 4 * sizeof(uint64_t));
+        memcpy(gy + 4 * i, y, 4 * sizeof(uint64_t));
+    }
+    /* stride = 2 * (n*G) = grp_size * G ;  stride2 = 2 * stride */
+    secp_pt str, str2;
+    secp_pt_double(&str, &pts[n - 1]);
+    secp_pt_double(&str2, &str);
+    secp_pt_to_affine(stride_x, stride_y, &str);
+    secp_pt_to_affine(stride2_x, stride2_y, &str2);
+
+    free(pts); free(zs); free(work);
+    return 0;
+}
+
 /* ---- core generation ------------------------------------------------------ */
 
 /* Generate `count` public keys for private keys [start, start+count).

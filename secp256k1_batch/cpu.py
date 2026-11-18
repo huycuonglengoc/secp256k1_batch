@@ -75,6 +75,49 @@ def _build_library() -> Path:
     raise RuntimeError(f"Failed to compile CPU backend: {last_error}")
 
 
+def build_generator_table(grp_size: int):
+    """Build the affine generator table used by the grouped GPU kernel.
+
+    Returns ``(gx, gy, stride_x, stride_y, stride2_x, stride2_y)`` as
+    little-endian ``uint64`` numpy arrays.  ``gx``/``gy`` hold ``grp_size // 2``
+    points (``(i+1)*G``); ``stride`` = ``grp_size * G`` and ``stride2`` =
+    ``2 * grp_size * G`` (4 limbs each).
+    """
+    import numpy as np
+
+    lib = ctypes.CDLL(str(_build_library()))
+    lib.secp256k1_build_table.argtypes = [
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.c_uint64,
+    ]
+    lib.secp256k1_build_table.restype = ctypes.c_int
+
+    n = grp_size // 2
+    gx = np.zeros(n * 4, dtype=np.uint64)
+    gy = np.zeros(n * 4, dtype=np.uint64)
+    sx = np.zeros(4, dtype=np.uint64)
+    sy = np.zeros(4, dtype=np.uint64)
+    s2x = np.zeros(4, dtype=np.uint64)
+    s2y = np.zeros(4, dtype=np.uint64)
+    rc = lib.secp256k1_build_table(
+        gx.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+        gy.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+        sx.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+        sy.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+        s2x.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+        s2y.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+        ctypes.c_uint64(grp_size),
+    )
+    if rc != 0:
+        raise RuntimeError(f"secp256k1_build_table failed with code {rc}")
+    return gx, gy, sx, sy, s2x, s2y
+
+
 class CPUBackend:
     """Generates public keys for a contiguous private-key range on the CPU."""
 

@@ -17,22 +17,28 @@ public keys:   start·G, (start+1)·G, ..., (start+count-1)·G
 ## The single most important optimization
 
 A naive implementation does a full 256-bit scalar multiplication for every key
-(~256 point doublings + ~128 additions). Instead, this package computes **only
-the first key** of each sub-range with a scalar multiplication and derives every
-following key with **one point addition per key** (`P ← P + G`):
+(~256 point doublings + ~128 additions). This package instead uses the
+**grouped-affine** technique — the same algorithm used by high-throughput
+scanners such as VanitySearch / KeyHunt (which reach ~1 Gkeys/s on an L4 and
+~3.6 Gkeys/s on an RTX 4090):
 
-* **Jacobian coordinates** — no field inversion in the hot loop.
-* **Mixed addition** (`madd-2004-hmv`, 7M+4S) — adds the affine generator to a
-  Jacobian accumulator in ~11 field multiplications.
-* **Montgomery batch inversion** — converts all Jacobian points back to affine
-  with a *single* inversion per sub-range instead of one per key.
-* **256-bit modular arithmetic on 64×64→128-bit products** (`unsigned __int128`
-  on CPU, the equivalent on CUDA), with the secp256k1-specific reduction
-  `2²⁵⁶ ≡ 2³² + 977 (mod p)`.
+* **Affine coordinates + shared inversion.** Each thread generates a block of
+  `grp_size` keys around an affine centre `S`. The only field inversions are the
+  deltas `(d·G).x − S.x`, batch-inverted once per block with a Montgomery
+  product tree, and **every inverse is reused by `S − d·G` and `S + d·G`**. Each
+  key then costs just **one multiplication + one squaring + a few subtractions**
+  (≈2–3 field multiplications), versus ~11 for a Jacobian mixed addition.
+* **No per-key scalar multiplication.** Only the block centres need a scalar
+  multiplication, computed once in a cheap setup kernel — the hot loop is pure
+  point addition.
+* **256-bit modular arithmetic on 64×64→128-bit products** (`unsigned __int128`),
+  with the secp256k1-specific reduction `2²⁵⁶ ≡ 2³² + 977 (mod p)`, and a
+  257-bit→256-bit scalar reduction modulo the group order `n`.
 
-The same field/point code (`csrc/secp256k1_field.h`, `csrc/secp256k1_point.h`)
-is compiled for **both** the CPU and the GPU, so one implementation is
-cross-validated by two independent devices against the pure-Python reference.
+The correctness-critical field/point helpers (`csrc/secp256k1_field.h`,
+`csrc/secp256k1_point.h`, `csrc/secp256k1_grouped.h`) are compiled for **both**
+the CPU and the GPU and cross-validated against the pure-Python reference and a
+CPU mirror of the exact grouped algorithm.
 
 ## Backends
 
@@ -79,12 +85,19 @@ python3 -m secp256k1_batch.cli --start 1 --count 1000000 --compressed --backend 
 
 ## Tuning
 
-* GPU: `--keys-per-thread` controls the scalar-multiply vs. add trade-off.
-  The per-thread batch inversion is a long serial chain, so smaller values
-  shorten it and expose more parallelism. `64` is the measured sweet spot on
-  a T4; try `32`–`256` for your GPU.
-* GPU: `--gpu-chunk` bounds device memory; the range is processed in chunks.
-* CPU: `--nthreads` sets OpenMP threads (Colab: use the CPU core count).
+* GPU `--grp-size`: keys generated per thread per step (even). Larger values
+  amortize the single field inversion over more keys and reduce work per key,
+  but use more local memory and fewer threads for small counts. `256` is a good
+  default; sweep `64`–`1024` for your GPU.
+* GPU `--gpu-threads`: target thread count (grid size). The kernel splits the
+  range into blocks of `grp_size` keys across up to this many threads.
+* GPU `--gpu-chunk`: bounds device memory; the range is processed in chunks.
+* CPU `--nthreads`: sets OpenMP threads (Colab: use the CPU core count).
+
+Note: `generate_public_keys` returns the keys as bytes, so the end-to-end rate
+for very large counts is ultimately bounded by PCIe/device-to-host transfer,
+not by the kernel. The kernel itself runs substantially faster than the
+transfer; benchmark it directly with CUDA events if you want the raw GPU rate.
 
 ## Correctness
 
@@ -109,6 +122,8 @@ secp256k1_batch/
   csrc/
     secp256k1_field.h   256-bit modular arithmetic (shared CPU/CUDA)
     secp256k1_point.h   Jacobian point arithmetic (shared CPU/CUDA)
-    cpukernel.c         CPU range generator (OpenMP, batch inversion)
-    cuda_kernel.cu      GPU range generator (one thread per sub-range)
+    secp256k1_grouped.h grouped-affine helpers (shared CPU/CUDA)
+    cpukernel.c         CPU range generator + generator-table builder
+    cuda_kernel.cu      GPU range generator (Jacobian, one thread per sub-range)
+    cuda_kernel_grouped.cu  GPU range generator (grouped-affine, fast path)
 ```
