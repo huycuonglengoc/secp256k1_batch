@@ -21,6 +21,11 @@ import numpy as np
 
 _CSRC_DIR = Path(__file__).parent / "csrc"
 
+# Bumped whenever the kernel sources or the NVRTC compile options change.  The
+# Colab bootstrap asserts this marker so a stale checkout (failed git update)
+# is caught immediately instead of surfacing as a confusing compiler error.
+GPU_BUILD_VERSION = 5
+
 # grp_size -> compiled RawModule (NVRTC runs at most once per grp_size).
 _COMPILED: dict = {}
 
@@ -41,9 +46,10 @@ def _compiled_module(grp_size: int):
 
     source = (_CSRC_DIR / "cuda_kernel_grouped.cu").read_text()
     source = f"#define SECP_GRP_SIZE {grp_size}\n" + source
-    # NVRTC requires --device-int128 to enable __int128 in device code; nvcc
-    # supports it by default and does not accept that flag.
-    nvrtc_options = ("-I" + str(_CSRC_DIR), "--std=c++11", "--device-int128", "-O3")
+    # NVRTC requires --device-int128 to enable __int128 in device code, and it
+    # has no -O flag (it optimizes fully by default; passing -O3 there is an
+    # NVRTC_ERROR_INVALID_OPTION).  nvcc does accept -O3.
+    nvrtc_options = ("-I" + str(_CSRC_DIR), "--std=c++11", "--device-int128")
     nvcc_options = ("-I" + str(_CSRC_DIR), "--std=c++11", "-O3")
     try:
         module = cp.RawModule(code=source, options=nvrtc_options)
