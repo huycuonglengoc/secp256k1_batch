@@ -25,7 +25,7 @@ _CSRC_DIR = Path(__file__).parent / "csrc"
 # Bumped whenever the kernel sources or the NVRTC compile options change.  The
 # Colab bootstrap asserts this marker so a stale checkout (failed git update)
 # is caught immediately instead of surfacing as a confusing compiler error.
-GPU_BUILD_VERSION = 8
+GPU_BUILD_VERSION = 9
 
 # grp_size -> compiled RawModule (NVRTC runs at most once per grp_size).
 _COMPILED: dict = {}
@@ -145,6 +145,9 @@ class GPUBackend:
         """
         if count == 0:
             return b""
+        self.last_path = None
+        self.last_error = None
+        self.copy_mode = None
         ranges = _chunk_ranges(count, self._pipeline_chunk())
         if len(ranges) == 1:
             self.last_path = "single"
@@ -190,24 +193,42 @@ class GPUBackend:
         return out.tobytes()
 
     def _copy_d2h(self, dev, host: np.ndarray, nbytes: int, stream) -> None:
-        """Async device->host copy into a pinned buffer (two API fallbacks)."""
+        """Async device->host copy into pinned memory (three API fallbacks).
+
+        ``host`` must be a pinned uint8 view of exactly ``nbytes`` bytes so the
+        copy is a true DMA transfer that can overlap with the next chunk's
+        kernels.  Only the last resort is synchronous.
+        """
+        rt = self.cp.cuda.runtime
         try:
             dev.get(out=host, stream=stream)
             self.copy_mode = "get(out=,stream=)"
             return
         except Exception as first:
             try:
-                self.cp.cuda.runtime.memcpy(
+                # cudaMemcpyAsync: the canonical async D2H into pinned memory.
+                rt.memcpyAsync(
                     int(host.ctypes.data),
                     int(dev.data.ptr),
                     nbytes,
-                    self.cp.cuda.runtime.memcpyDeviceToHost,
+                    rt.memcpyDeviceToHost,
                     int(stream.ptr),
                 )
-                self.copy_mode = "runtime.memcpy(stream)"
+                self.copy_mode = "memcpyAsync"
                 return
-            except Exception:
-                raise RuntimeError(f"async D2H unavailable: {first!r}") from first
+            except Exception as second:
+                try:
+                    # Correct but synchronous: wait for this stream's kernels
+                    # (our streams are non-blocking, so an implicit-sync copy
+                    # would NOT be ordered after them), then copy pageable.
+                    stream.synchronize()
+                    dev.get(out=host)
+                    self.copy_mode = "get(sync-fallback)"
+                    return
+                except Exception:
+                    raise RuntimeError(
+                        f"async D2H unavailable: get={first!r} memcpyAsync={second!r}"
+                    ) from second
 
     @staticmethod
     def _pinned_host(slots, idx: int, nbytes: int):
@@ -340,10 +361,24 @@ class GPUBackend:
         stream = cp.cuda.Stream(non_blocking=True)
         t0 = time.perf_counter()
         with stream:
-            cp.cuda.runtime.memcpy(
-                int(mem.ptr), int(dev.data.ptr), nbytes,
-                cp.cuda.runtime.memcpyDeviceToHost, int(stream.ptr),
-            )
+            try:
+                cp.cuda.runtime.memcpyAsync(
+                    int(mem.ptr),
+                    int(dev.data.ptr),
+                    nbytes,
+                    cp.cuda.runtime.memcpyDeviceToHost,
+                    int(stream.ptr),
+                )
+                result["async_api"] = "memcpyAsync"
+            except Exception:
+                stream.synchronize()
+                cp.cuda.runtime.memcpy(
+                    int(mem.ptr),
+                    int(dev.data.ptr),
+                    nbytes,
+                    cp.cuda.runtime.memcpyDeviceToHost,
+                )
+                result["async_api"] = "memcpy(sync)"
             stream.synchronize()
         result["pinned_async_GBps"] = nbytes / max(time.perf_counter() - t0, 1e-9) / 1e9
 
@@ -363,13 +398,30 @@ class GPUBackend:
 
         The full range never has to exist in RAM at once, which matters when the
         output is streamed straight to a file (the CLI path) instead of
-        materialised as one ``bytes`` object.
+        materialised as one ``bytes`` object.  Each chunk still takes the pinned
+        asynchronous copy path, so streaming is as fast as ``generate`` minus the
+        final full-range copy.
         """
         step = max(1, int(chunk) if chunk else self._pipeline_chunk())
+        stream = self.cp.cuda.Stream(non_blocking=True)
+        slots: list = [None]
         for offset in range(0, count, step):
             n = min(step, count - offset)
-            raw = self._generate_chunk(start + offset, n)
-            yield _compress(raw) if compressed else raw
+            nbytes = n * 64
+            with stream:
+                dev = self._launch(start + offset, n)
+                host = self._pinned_host(slots, 0, nbytes)
+                self._copy_d2h(dev, host, nbytes, stream)
+            stream.synchronize()  # this chunk's copy is complete
+            self.last_path = "stream"
+            if compressed:
+                arr = host[:nbytes].reshape(n, 64)
+                view = np.empty((n, 33), dtype=np.uint8)
+                view[:, 0] = 0x02 | (arr[:, 63] & 1)
+                view[:, 1:] = arr[:, :32]
+                yield view.tobytes()
+            else:
+                yield host[:nbytes].tobytes()
 
 
 def _chunk_ranges(count: int, chunk: int):
