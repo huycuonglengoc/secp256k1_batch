@@ -165,6 +165,9 @@ that path as cheap as possible:
 * **async copies.** D2H runs on two alternating CUDA streams, so chunk N's
   kernels overlap chunk N-1's transfer. Measured on Colab: pinned D2H ~12.8 GB/s
   versus ~2.8 GB/s pageable, while a plain host `tobytes()` is ~1.6 GB/s.
+* **device-side SEC compression.** With `compressed=True` the
+  `secp256k1_compress_kernel` turns 64-byte keys into 33-byte keys on the GPU,
+  so 48% less data crosses PCIe and there is no host conversion pass.
 
 That last number is the real ceiling of a bytes-returning API: producing 3.2 GB
 of `bytes` costs about 2 s no matter how fast the GPU is. Use

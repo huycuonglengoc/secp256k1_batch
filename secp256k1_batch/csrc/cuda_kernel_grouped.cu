@@ -7,11 +7,13 @@
  * every inverse is shared by S - d*G and S + d*G.  Each key then costs one
  * multiplication, one squaring, and a few subtractions.
  *
- *   secp256k1_setup_kernel   : computes each thread's affine centre.
- *   secp256k1_grouped_kernel : generates the keys.
+ *   secp256k1_setup_kernel    : computes each thread's affine centre.
+ *   secp256k1_grouped_kernel  : generates the keys.
+ *   secp256k1_compress_kernel : optional SEC compression, on the device.
  *
- * The kernel outputs uncompressed keys (x || y, 64 bytes); the host compresses
- * to SEC (33-byte) form if requested.
+ * The kernels output uncompressed keys (x || y, 64 bytes); secp256k1_compress_kernel
+ * turns them into SEC (33-byte) form on the device when requested, which halves
+ * the device-to-host traffic and skips a host-side pass.
  */
 #include "secp256k1_point.h"
 #include "secp256k1_grouped.h"
@@ -117,4 +119,23 @@ extern "C" __global__ void secp256k1_grouped_kernel(
             secp_affine_add_inv(sx, sy, sx, sy, stx, sty, dx[SECP_HSIZE]);
         }
     }
+}
+
+/* SEC compression on the device: 64-byte (x || y) keys in, 33-byte
+ * (parity || x) keys out.  Keeping this on the GPU halves the PCIe transfer
+ * and removes the host-side conversion pass; the parity of y is its last
+ * big-endian byte.  One thread per key, byte-wise stores because the 33-byte
+ * stride leaves the x field 1 mod 4 bytes aligned. */
+extern "C" __global__ void secp256k1_compress_kernel(
+    const unsigned char *__restrict__ raw,
+    unsigned char *__restrict__ comp,
+    const unsigned long long n) {
+    const unsigned long long i =
+        (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const unsigned char *src = raw + i * 64ULL;
+    unsigned char *dst = comp + i * 33ULL;
+    dst[0] = (unsigned char)(0x02 | (src[63] & 1));
+#pragma unroll
+    for (int k = 0; k < 32; k++) dst[1 + k] = src[k];
 }

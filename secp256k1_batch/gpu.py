@@ -26,7 +26,7 @@ _CSRC_DIR = Path(__file__).parent / "csrc"
 # Bumped whenever the kernel sources or the NVRTC compile options change.  The
 # Colab bootstrap asserts this marker so a stale checkout (failed git update)
 # is caught immediately instead of surfacing as a confusing compiler error.
-GPU_BUILD_VERSION = 10
+GPU_BUILD_VERSION = 11
 
 # grp_size -> compiled RawModule (NVRTC runs at most once per grp_size).
 _COMPILED: dict = {}
@@ -88,6 +88,10 @@ class GPUBackend:
         module = _compiled_module(self.grp_size)
         self._setup = module.get_function("secp256k1_setup_kernel")
         self._main = module.get_function("secp256k1_grouped_kernel")
+        try:
+            self._compress_fn = module.get_function("secp256k1_compress_kernel")
+        except Exception:  # older kernel source without the compressor
+            self._compress_fn = None
         self._gx, self._gy, self._stride = self._load_tables()
         self._comb_cache: dict = {}
         # Diagnostics for the output path (filled in by generate()).
@@ -194,10 +198,18 @@ class GPUBackend:
         self.staging = None
 
     def _generate_into(self, start: int, ranges, compressed: bool, dest, at: int) -> None:
-        if compressed:
-            self._stream_compressed(start, ranges, dest, at)
-        else:
+        if not compressed:
             self._stream_raw(start, ranges, dest, at)
+            return
+        if self._compress_fn is not None:
+            try:
+                self._stream_compressed_gpu(start, ranges, dest, at)
+                return
+            except Exception as exc:
+                # Device compression failed: fall back to the host converter
+                # rather than to the fully sequential path.
+                self.last_error = f"gpu compress failed: {exc!r}"
+        self._stream_compressed_host(start, ranges, dest, at)
 
     def _stream_raw(self, start: int, ranges, dest, at: int) -> None:
         """D2H straight into the caller's host buffer (no intermediate copy)."""
@@ -226,7 +238,40 @@ class GPUBackend:
                 item[0].synchronize()
         self.last_path = "pipelined(raw)"
 
-    def _stream_compressed(self, start: int, ranges, dest, at: int) -> None:
+    def _compress_device(self, comp, raw, n: int) -> None:
+        """Run the device-side SEC compressor: 64 B/key -> 33 B/key."""
+        if self._compress_fn is None:
+            raise RuntimeError("device SEC compressor unavailable")
+        threads = 256
+        blocks = (int(n) + threads - 1) // threads
+        self._compress_fn((blocks,), (threads,), (raw, comp, np.uint64(n)))
+
+    def _stream_compressed_gpu(self, start: int, ranges, dest, at: int) -> None:
+        """SEC-compress on the device; D2H carries only 33 bytes per key."""
+        cp = self.cp
+        streams = (cp.cuda.Stream(non_blocking=True), cp.cuda.Stream(non_blocking=True))
+        inflight: list = [None, None]
+        for i, (offset, n) in enumerate(ranges):
+            s = i & 1
+            stream = streams[s]
+            if inflight[s] is not None:
+                inflight[s][0].synchronize()
+                inflight[s] = None
+            nbytes = n * 33
+            with stream:
+                raw, extras = self._launch(start + offset, n, keep=True)
+                comp = cp.empty(nbytes, dtype=cp.uint8)
+                self._compress_device(comp, raw, n)
+                self._copy_d2h(comp, dest[at : at + nbytes], nbytes, stream)
+            # Keep both device buffers alive until this stream is synchronized.
+            inflight[s] = (stream, extras, raw, comp)
+            at += nbytes
+        for item in inflight:
+            if item is not None:
+                item[0].synchronize()
+        self.last_path = "pipelined(compressed,gpu)"
+
+    def _stream_compressed_host(self, start: int, ranges, dest, at: int) -> None:
         """64-byte keys staged in pinned memory, converted to 33-byte SEC."""
         cp = self.cp
         streams = (cp.cuda.Stream(non_blocking=True), cp.cuda.Stream(non_blocking=True))
@@ -246,7 +291,7 @@ class GPUBackend:
             pending = (stream, host, nbytes, dev, extras)
         if pending is not None:
             at += self._finish_chunk(pending, True, dest, at)
-        self.last_path = "pipelined(compressed)"
+        self.last_path = "pipelined(compressed,host)"
 
     def alloc_host_buffer(self, nbytes: int):
         """Allocate the final host byte buffer as ``(owner, uint8 view)``.
@@ -473,6 +518,37 @@ class GPUBackend:
         result["tobytes_GBps"] = nbytes / max(time.perf_counter() - t0, 1e-9) / 1e9
         return result
 
+    def _chunk_bytes(self, stream, slots, start: int, n: int, compressed: bool) -> bytes:
+        """Materialise one chunk in host memory using the best available path."""
+        if not compressed:
+            with stream:
+                dev, _extras = self._launch(start, n, keep=True)
+                host = self._pinned_host(slots, 0, n * 64)
+                self._copy_d2h(dev, host, n * 64, stream)
+            stream.synchronize()
+            return host[: n * 64].tobytes()
+
+        if self._compress_fn is not None:
+            try:
+                with stream:
+                    raw, _extras = self._launch(start, n, keep=True)
+                    comp = self.cp.empty(n * 33, dtype=self.cp.uint8)
+                    self._compress_device(comp, raw, n)
+                    host = self._pinned_host(slots, 0, n * 33)
+                    self._copy_d2h(comp, host, n * 33, stream)
+                stream.synchronize()
+                return host[: n * 33].tobytes()
+            except Exception as exc:
+                self.last_error = f"gpu compress failed: {exc!r}"
+                stream.synchronize()  # drop any partially issued copy
+
+        with stream:
+            dev, _extras = self._launch(start, n, keep=True)
+            host = self._pinned_host(slots, 0, n * 64)
+            self._copy_d2h(dev, host, n * 64, stream)
+        stream.synchronize()
+        return _compress(host[: n * 64])
+
     def iter_chunks(
         self,
         start: int,
@@ -484,30 +560,17 @@ class GPUBackend:
 
         The full range never has to exist in RAM at once, which matters when the
         output is streamed straight to a file (the CLI path) instead of
-        materialised as one ``bytes`` object.  Each chunk still takes the pinned
-        asynchronous copy path, so streaming is as fast as ``generate`` minus the
-        final full-range copy.
+        materialised as one ``bytes`` object.  Each chunk takes the pinned
+        asynchronous copy path, and compressed chunks are SEC-compressed on the
+        device, so only 33 bytes per key cross the bus.
         """
         step = max(1, int(chunk) if chunk else self._pipeline_chunk())
         stream = self.cp.cuda.Stream(non_blocking=True)
         slots: list = [None]
         for offset in range(0, count, step):
             n = min(step, count - offset)
-            nbytes = n * 64
-            with stream:
-                dev = self._launch(start + offset, n)
-                host = self._pinned_host(slots, 0, nbytes)
-                self._copy_d2h(dev, host, nbytes, stream)
-            stream.synchronize()  # this chunk's copy is complete
             self.last_path = "stream"
-            if compressed:
-                arr = host[:nbytes].reshape(n, 64)
-                view = np.empty((n, 33), dtype=np.uint8)
-                view[:, 0] = 0x02 | (arr[:, 63] & 1)
-                view[:, 1:] = arr[:, :32]
-                yield view.tobytes()
-            else:
-                yield host[:nbytes].tobytes()
+            yield self._chunk_bytes(stream, slots, start + offset, n, compressed)
 
 
 def _chunk_ranges(count: int, chunk: int):
