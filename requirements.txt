@@ -1,0 +1,9 @@
+# Core dependencies.
+# The CPU backend also needs a C compiler on PATH (gcc/cc/clang); it is not a
+# pip dependency and is preinstalled on Google Colab.
+numpy>=1.20
+
+# GPU backend (optional): install the CuPy wheel that matches your CUDA runtime.
+# On Google Colab:
+#   !pip install cupy-cuda12x
+# CuPy bundles the CUDA runtime and NVRTC, so no separate nvcc install is needed.

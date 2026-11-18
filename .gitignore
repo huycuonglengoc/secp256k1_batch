@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Compiled native artifacts (the CPU backend builds these at runtime)
+*.so
+*.dylib
+*.o
+*.obj
+
+# Notebook / editor noise
+.ipynb_checkpoints/
+.DS_Store
+
+# Runtime output
+results/
+*.hex
+pubkeys*
