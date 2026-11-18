@@ -25,7 +25,22 @@ def _validate(start: int, count: int) -> None:
         raise ValueError("range exceeds 256 bits")
 
 
+_BACKEND_CACHE: dict = {}
+
+
 def _make_backend(name: str, opts: dict):
+    """Build (and cache) a backend instance.
+
+    The GPU backend compiles the CUDA kernel with NVRTC at construction, which
+    can take several seconds. Caching the instance means that cost is paid once
+    per process instead of once per ``generate_public_keys`` call.
+    """
+    key = (name, tuple(sorted(opts.items())))
+    cached = _BACKEND_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    backend: object
     if name == "reference":
         from .reference import public_keys_range
 
@@ -46,23 +61,27 @@ def _make_backend(name: str, opts: dict):
                     out[i * 64 + 32 : (i + 1) * 64] = y.to_bytes(32, "big")
                 return bytes(out)
 
-        return _Ref()
+        backend = _Ref()
 
-    if name == "cpu":
+    elif name == "cpu":
         from .cpu import CPUBackend
 
-        return CPUBackend()
+        backend = CPUBackend()
 
-    if name == "gpu":
+    elif name == "gpu":
         from .gpu import GPUBackend
 
-        return GPUBackend(
+        backend = GPUBackend(
             device=opts.get("gpu_device", 0),
             keys_per_thread=opts.get("keys_per_thread", 1024),
             chunk=opts.get("gpu_chunk", 1 << 22),
         )
 
-    raise ValueError(f"unknown backend {name!r}")
+    else:
+        raise ValueError(f"unknown backend {name!r}")
+
+    _BACKEND_CACHE[key] = backend
+    return backend
 
 
 def _resolve_backend(name: str) -> str:

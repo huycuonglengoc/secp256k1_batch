@@ -14,6 +14,11 @@ from .constants import MASK64, to_limbs
 
 _CSRC_DIR = Path(__file__).parent / "csrc"
 
+# Compiled CUDA module, cached so NVRTC runs at most once per process. The
+# kernel source does not depend on device/keys_per_thread/chunk (those are
+# passed as kernel arguments), so one module is shared by every backend.
+_COMPILED_MODULE = None
+
 
 def is_available() -> bool:
     try:
@@ -22,6 +27,24 @@ def is_available() -> bool:
         return True
     except Exception:
         return False
+
+
+def _compiled_module():
+    """Compile (once) and return the CuPy RawModule for the CUDA kernel."""
+    global _COMPILED_MODULE
+    if _COMPILED_MODULE is None:
+        import cupy as cp
+
+        source = (_CSRC_DIR / "cuda_kernel.cu").read_text()
+        # NVRTC requires --device-int128 to enable __int128 in device code; nvcc
+        # supports it by default and does not accept that flag.
+        nvrtc_options = ("-I" + str(_CSRC_DIR), "--std=c++11", "--device-int128")
+        nvcc_options = ("-I" + str(_CSRC_DIR), "--std=c++11")
+        try:
+            _COMPILED_MODULE = cp.RawModule(code=source, options=nvrtc_options)
+        except Exception:
+            _COMPILED_MODULE = cp.RawModule(code=source, options=nvcc_options, backend="nvcc")
+    return _COMPILED_MODULE
 
 
 class GPUBackend:
@@ -39,16 +62,7 @@ class GPUBackend:
         except Exception as error:
             raise RuntimeError(f"CUDA device {device} unavailable: {error}") from error
 
-        source = (_CSRC_DIR / "cuda_kernel.cu").read_text()
-        # NVRTC requires --device-int128 to enable __int128 in device code; nvcc
-        # supports it by default and does not accept that flag.
-        nvrtc_options = ("-I" + str(_CSRC_DIR), "--std=c++11", "--device-int128")
-        nvcc_options = ("-I" + str(_CSRC_DIR), "--std=c++11")
-        try:
-            module = cp.RawModule(code=source, options=nvrtc_options)
-        except Exception:
-            module = cp.RawModule(code=source, options=nvcc_options, backend="nvcc")
-        self._kernel = module.get_function("secp256k1_batch_kernel")
+        self._kernel = _compiled_module().get_function("secp256k1_batch_kernel")
 
     @property
     def name(self) -> str:
