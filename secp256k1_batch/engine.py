@@ -144,6 +144,41 @@ def generate_public_keys(
     return worker.generate(start, count, compressed)
 
 
+def iter_public_key_chunks(
+    start: int,
+    count: int,
+    compressed: bool = False,
+    backend: str = "auto",
+    chunk: int | None = None,
+    **opts,
+):
+    """Yield the range as contiguous byte chunks instead of one ``bytes`` blob.
+
+    Backends with a streaming path never hold more than one chunk in host RAM,
+    which is what a ``-o file`` consumer wants (constant memory, no giant
+    ``bytes`` object or final join copy).
+    """
+    if backend not in BACKENDS:
+        raise ValueError(f"backend must be one of {BACKENDS}")
+    _validate(start, count)
+    if count == 0:
+        return
+    resolved = _resolve_backend(backend)
+    worker = _make_backend(resolved, opts)
+    if hasattr(worker, "iter_chunks"):
+        yield from worker.iter_chunks(start, count, compressed, chunk)
+        return
+    nthreads = opts.get("nthreads", 0)
+    if resolved == "cpu" and nthreads:
+        data = worker.generate(start, count, compressed, nthreads=nthreads)
+    else:
+        data = worker.generate(start, count, compressed)
+    stride = 33 if compressed else 64
+    step = stride * int(chunk or (1 << 20))
+    for offset in range(0, len(data), step):
+        yield data[offset : offset + step]
+
+
 def iter_keys(data: bytes, compressed: bool = False):
     """Yield each public key as an (x, y) tuple of Python ints."""
     if compressed:

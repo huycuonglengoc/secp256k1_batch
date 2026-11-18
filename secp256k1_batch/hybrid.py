@@ -61,7 +61,11 @@ class HybridBackend:
         from .cpu import CPUBackend
 
         self.cpu = CPUBackend()
-        self.cpu_threads = int(cpu_threads) or max(1, (os.cpu_count() or 2) - 1)
+        # Leave at least one core free for the main thread, which is busy with
+        # the pinned D2H bookkeeping and the output copies while the CPU share
+        # runs: oversubscribing every core makes both slower (measured on
+        # Colab: 11 workers on 12 vCPUs hurt the hybrid rate).
+        self.cpu_threads = int(cpu_threads) or max(1, (os.cpu_count() or 2) - 2)
 
         if gpu is None:
             from .gpu import GPUBackend, is_available
@@ -81,9 +85,12 @@ class HybridBackend:
         else:
             share = 0.02
 
-        # Never give the CPU more than half: the GPU is far faster at bulk EC
-        # generation, and a large CPU share would only lengthen the critical path.
-        limit = 1.0 if self.gpu is None else 0.5
+        # Never give the CPU more than a quarter of the range: the GPU is far
+        # faster at bulk EC generation, and the host threads also have to carry
+        # the D2H copies and output assembly, so an aggressive CPU share would
+        # only add memory-bandwidth contention (measured on Colab: a 24% share
+        # made the 50M-key run slower than GPU-only).
+        limit = 1.0 if self.gpu is None else 0.25
         self.cpu_share = min(max(share, 0.0), limit)
 
     # -- calibration -----------------------------------------------------
@@ -146,3 +153,32 @@ class HybridBackend:
         if "error" in result:
             raise result["error"]
         return result["data"] + gpu_part
+
+    def iter_chunks(
+        self,
+        start: int,
+        count: int,
+        compressed: bool = False,
+        chunk: int | None = None,
+    ):
+        """Yield the range in contiguous chunks (constant host memory).
+
+        The CPU share is produced first (it is a contiguous prefix), then the
+        GPU streams its own chunks one at a time.
+        """
+        if count == 0:
+            return
+        if self.gpu is None or self.cpu_share <= 0.0:
+            if self.gpu is None:
+                yield self.cpu.generate(
+                    start, count, compressed, nthreads=self.cpu_threads
+                )
+            else:
+                yield from self.gpu.iter_chunks(start, count, compressed, chunk)
+            return
+
+        n_cpu, n_gpu = split_counts(count, self.cpu_share)
+        if n_cpu:
+            yield self.cpu.generate(start, n_cpu, compressed, nthreads=self.cpu_threads)
+        if n_gpu:
+            yield from self.gpu.iter_chunks(start + n_cpu, n_gpu, compressed, chunk)

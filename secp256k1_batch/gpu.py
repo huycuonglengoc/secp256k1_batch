@@ -15,6 +15,7 @@ per ``grp_size`` value.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import numpy as np
@@ -24,7 +25,7 @@ _CSRC_DIR = Path(__file__).parent / "csrc"
 # Bumped whenever the kernel sources or the NVRTC compile options change.  The
 # Colab bootstrap asserts this marker so a stale checkout (failed git update)
 # is caught immediately instead of surfacing as a confusing compiler error.
-GPU_BUILD_VERSION = 6
+GPU_BUILD_VERSION = 7
 
 # grp_size -> compiled RawModule (NVRTC runs at most once per grp_size).
 _COMPILED: dict = {}
@@ -88,6 +89,10 @@ class GPUBackend:
         self._main = module.get_function("secp256k1_grouped_kernel")
         self._gx, self._gy, self._stride = self._load_tables()
         self._comb_cache: dict = {}
+        # Diagnostics for the output path (filled in by generate()).
+        self.last_path: str | None = None
+        self.last_error: str | None = None
+        self.copy_mode: str | None = None
 
     def _load_tables(self):
         from .cpu import build_generator_table
@@ -142,11 +147,15 @@ class GPUBackend:
             return b""
         ranges = _chunk_ranges(count, self._pipeline_chunk())
         if len(ranges) == 1:
+            self.last_path = "single"
             raw = self._generate_chunk(start, count)
             return _compress(raw) if compressed else raw
         try:
-            return self._generate_pipelined(start, ranges, compressed)
-        except Exception:
+            out = self._generate_pipelined(start, ranges, compressed)
+            return out
+        except Exception as exc:
+            self.last_path = "sequential"
+            self.last_error = f"{type(exc).__name__}: {exc}"
             raw = b"".join(
                 self._generate_chunk(start + offset, n) for offset, n in ranges
             )
@@ -156,18 +165,19 @@ class GPUBackend:
         cp = self.cp
         streams = (cp.cuda.Stream(non_blocking=True), cp.cuda.Stream(non_blocking=True))
         slots: list = [None, None]  # (pinned MemoryPointer, numpy view), ping-pong
-        parts: list[bytes] = []
-        pending = None  # (stream, host_view, nbytes) of the chunk being copied
+        stride = 33 if compressed else 64
+        out = np.empty(sum(n for _, n in ranges) * stride, dtype=np.uint8)
+        write_at = 0
+        pending = None
         for i, (offset, n) in enumerate(ranges):
             nbytes = n * 64
             stream = streams[i & 1]
             with stream:
                 dev, extras = self._launch(start + offset, n, keep=True)
                 host = self._pinned_host(slots, i & 1, nbytes)
-                # Async D2H on this stream, ordered after the kernels above.
-                dev.get(out=host, stream=stream)
+                self._copy_d2h(dev, host, nbytes, stream)
             if pending is not None:
-                parts.append(self._finish_chunk(pending, compressed))
+                write_at += self._finish_chunk(pending, compressed, out, write_at)
             # Keep every device buffer of this chunk (`dev`, and the centre
             # arrays / comb points in `extras`) referenced until its stream has
             # been synchronized: CuPy's memory pool is not stream-aware and
@@ -175,8 +185,29 @@ class GPUBackend:
             # or the async copy are still reading them.
             pending = (stream, host, nbytes, dev, extras)
         if pending is not None:
-            parts.append(self._finish_chunk(pending, compressed))
-        return b"".join(parts)
+            write_at += self._finish_chunk(pending, compressed, out, write_at)
+        self.last_path = "pipelined"
+        return out.tobytes()
+
+    def _copy_d2h(self, dev, host: np.ndarray, nbytes: int, stream) -> None:
+        """Async device->host copy into a pinned buffer (two API fallbacks)."""
+        try:
+            dev.get(out=host, stream=stream)
+            self.copy_mode = "get(out=,stream=)"
+            return
+        except Exception as first:
+            try:
+                self.cp.cuda.runtime.memcpy(
+                    int(host.ctypes.data),
+                    int(dev.data.ptr),
+                    nbytes,
+                    self.cp.cuda.runtime.memcpyDeviceToHost,
+                    int(stream.ptr),
+                )
+                self.copy_mode = "runtime.memcpy(stream)"
+                return
+            except Exception:
+                raise RuntimeError(f"async D2H unavailable: {first!r}") from first
 
     @staticmethod
     def _pinned_host(slots, idx: int, nbytes: int):
@@ -197,11 +228,25 @@ class GPUBackend:
         return slot[1][:nbytes]
 
     @staticmethod
-    def _finish_chunk(pending, compressed: bool) -> bytes:
+    def _finish_chunk(pending, compressed: bool, dest: np.ndarray, at: int) -> int:
+        """Copy one finished pinned chunk into the caller's output buffer.
+
+        Returns the number of bytes written (``n*64`` uncompressed, ``n*33``
+        compressed).  This is the only host-side pass over the data; the final
+        ``bytes`` copy happens once, in ``generate``.
+        """
         stream, host, nbytes, _dev, _extras = pending
         stream.synchronize()  # the copy for this chunk is now complete
-        view = host[:nbytes]
-        return _compress(view) if compressed else view.tobytes()
+        src = host[:nbytes]
+        if compressed:
+            n = nbytes // 64
+            view = dest[at : at + n * 33].reshape(n, 33)
+            arr = src.reshape(n, 64)
+            view[:, 0] = 0x02 | (arr[:, 63] & 1)
+            view[:, 1:] = arr[:, :32]
+            return n * 33
+        dest[at : at + nbytes] = src
+        return nbytes
 
     def _generate_chunk(self, start: int, n: int) -> bytes:
         out = self._launch(start, n)
@@ -268,6 +313,63 @@ class GPUBackend:
             end_ev.synchronize()
             best = min(best, cp.cuda.get_elapsed_time(start_ev, end_ev) / 1000.0)
         return best
+
+    def benchmark_transfer(self, start: int = 1, count: int = 4_000_000) -> dict:
+        """Measure the output path separately from the kernels.
+
+        Returns throughput (GB/s) for a pageable ``get()``, an asynchronous
+        device-to-host copy into pinned memory, and the host ``tobytes()`` pass.
+        This isolates which stage limits the end-to-end rate.
+        """
+        cp = self.cp
+        n = int(count)
+        nbytes = n * 64
+        dev = self._launch(start, n)
+        cp.cuda.get_current_stream().synchronize()
+        result: dict = {"count": n, "MB": nbytes / 1e6}
+
+        t0 = time.perf_counter()
+        _ = dev.get()
+        result["pageable_get_GBps"] = nbytes / max(time.perf_counter() - t0, 1e-9) / 1e9
+
+        import ctypes
+
+        mem = cp.cuda.alloc_pinned_memory(nbytes)
+        buf = (ctypes.c_uint8 * nbytes).from_address(int(mem.ptr))
+        pinned = np.frombuffer(buf, dtype=np.uint8)
+        stream = cp.cuda.Stream(non_blocking=True)
+        t0 = time.perf_counter()
+        with stream:
+            cp.cuda.runtime.memcpy(
+                int(mem.ptr), int(dev.data.ptr), nbytes,
+                cp.cuda.runtime.memcpyDeviceToHost, int(stream.ptr),
+            )
+            stream.synchronize()
+        result["pinned_async_GBps"] = nbytes / max(time.perf_counter() - t0, 1e-9) / 1e9
+
+        t0 = time.perf_counter()
+        _ = pinned.tobytes()
+        result["tobytes_GBps"] = nbytes / max(time.perf_counter() - t0, 1e-9) / 1e9
+        return result
+
+    def iter_chunks(
+        self,
+        start: int,
+        count: int,
+        compressed: bool = False,
+        chunk: int | None = None,
+    ):
+        """Yield the range as contiguous byte chunks (constant host memory).
+
+        The full range never has to exist in RAM at once, which matters when the
+        output is streamed straight to a file (the CLI path) instead of
+        materialised as one ``bytes`` object.
+        """
+        step = max(1, int(chunk) if chunk else self._pipeline_chunk())
+        for offset in range(0, count, step):
+            n = min(step, count - offset)
+            raw = self._generate_chunk(start + offset, n)
+            yield _compress(raw) if compressed else raw
 
 
 def _chunk_ranges(count: int, chunk: int):

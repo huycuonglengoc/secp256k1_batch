@@ -16,7 +16,7 @@ import argparse
 import sys
 import time
 
-from .engine import generate_public_keys
+from .engine import generate_public_keys, iter_public_key_chunks
 
 
 def _parse_int(value: str) -> int:
@@ -51,10 +51,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.count < 0:
         raise SystemExit("--count must be non-negative")
 
-    started = time.perf_counter()
-    data = generate_public_keys(
-        args.start,
-        args.count,
+    kwargs = dict(
         compressed=args.compressed,
         backend=args.backend,
         nthreads=args.nthreads,
@@ -64,17 +61,21 @@ def main(argv: list[str] | None = None) -> int:
         gpu_chunk=args.gpu_chunk,
         gpu_device=args.gpu_device,
     )
-    elapsed = time.perf_counter() - started
 
+    started = time.perf_counter()
     if args.output:
+        # Stream chunk by chunk: constant host memory, no full-range bytes copy.
         mode = "wb" if args.format == "bin" else "w"
         with open(args.output, mode) as handle:
-            if args.format == "bin":
-                handle.write(data)
-            else:
-                _emit_hex(data, args.compressed, handle)
+            for part in iter_public_key_chunks(args.start, args.count, **kwargs):
+                if args.format == "bin":
+                    handle.write(part)
+                else:
+                    _emit_hex(part, args.compressed, handle)
     else:
+        data = generate_public_keys(args.start, args.count, **kwargs)
         _emit_hex(data, args.compressed, sys.stdout)
+    elapsed = time.perf_counter() - started
 
     if args.count:
         print(f"{args.count} keys in {elapsed:.3f}s ({args.count / elapsed:.0f} keys/s)", file=sys.stderr)
